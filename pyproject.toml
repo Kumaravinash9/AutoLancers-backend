@@ -1,5 +1,5 @@
 [project]
-name = "automatelancers-backend"
+name = "autolancers-backend"
 version = "0.1.0"
 description = "Freelance auto-bid assistant: discovers Freelancer.com jobs, scores them, drafts proposals."
 requires-python = ">=3.12"

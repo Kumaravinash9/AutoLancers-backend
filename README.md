@@ -1,4 +1,4 @@
-# automateLancers — backend
+# AutoLancers — backend
 
 Freelance auto-bid assistant. Polls Freelancer.com for new projects, scores them against your
 profile, and drafts a tailored proposal with Claude for each good match.
@@ -6,13 +6,13 @@ profile, and drafts a tailored proposal with Claude for each good match.
 **v1 is draft-only.** Nothing is ever submitted to Freelancer.com — you review each draft and copy
 it across yourself. The `bid` OAuth scope is deliberately not requested.
 
-The frontend lives in a separate repo: `automateLancers-frontend`.
+The frontend lives in a separate repo: `AutoLancers-frontend`.
 
 ## Requirements
 
 - Python 3.12+
 - PostgreSQL 14+ (a `docker compose` file is included)
-- A Freelancer.com OAuth app (self-service at https://accounts.freelancer.com/settings/create_app)
+- A Freelancer.com OAuth app (create one at https://accounts.freelancer.com/settings/develop)
 - A Gemini API key from https://aistudio.google.com/apikey (or an Anthropic key — see below)
 
 ## Setup

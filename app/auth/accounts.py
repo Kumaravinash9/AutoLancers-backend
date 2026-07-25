@@ -1,7 +1,7 @@
 """Platform accounts: passwords, sessions, and role checks.
 
 Distinct from ``freelancer_oauth``, which authenticates you *to Freelancer.com*. This module is
-about who you are on automateLancers itself.
+about who you are on AutoLancers itself.
 
 Roles are enforced server-side on every request. The frontend hides admin links, but hiding a
 link is presentation — the check that matters is the dependency on the route.

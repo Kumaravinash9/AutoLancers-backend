@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop_scheduler()
 
 
-app = FastAPI(title="automateLancers", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="AutoLancers", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
