@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from app.services import drafting
-from app.services.drafting import DraftingError, _build_user_message, _budget_line
+from app.services.drafting import DraftingError, _budget_line, _build_user_message
 from tests.test_scoring import make_job, make_profile
 
 

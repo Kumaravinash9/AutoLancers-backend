@@ -142,7 +142,9 @@ async def seed() -> None:
             row.rejected = result.rejected
             row.rejection_reason = result.rejection_reason
 
-            verdict = f"rejected — {result.rejection_reason}" if result.rejected else f"{result.score}"
+            verdict = (
+                f"rejected — {result.rejection_reason}" if result.rejected else f"{result.score}"
+            )
             print(f"  {posting.title[:52]:<54} {verdict}")
 
         await session.commit()
