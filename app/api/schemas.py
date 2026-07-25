@@ -110,3 +110,69 @@ class AuthStatus(BaseModel):
     scope: str | None = None
     expires_at: dt.datetime | None = None
     detail: str | None = None
+
+
+class Credentials(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=200)
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    role: str
+    is_active: bool
+    created_at: dt.datetime
+    last_login_at: dt.datetime | None
+
+
+class RoleUpdate(BaseModel):
+    role: str = Field(pattern="^(user|admin)$")
+
+
+class AdminUserOut(BaseModel):
+    id: int
+    email: str
+    role: str
+    is_active: bool
+    created_at: dt.datetime
+    last_login_at: dt.datetime | None
+    job_count: int
+    connected: bool
+    connection_scope: str | None
+
+
+class CycleRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    started_at: dt.datetime
+    duration_ms: int
+    fetched: int
+    created: int
+    updated: int
+    rejected: int
+    drafted: int
+    draft_failures: int
+    authenticated: bool
+    trigger: str
+    error: str | None
+
+
+class AdminOverview(BaseModel):
+    total_users: int
+    active_users: int
+    connected_accounts: int
+    total_jobs: int
+    matched_jobs: int
+    drafted_jobs: int
+    bids_placed: int
+    proposal_input_tokens: int
+    proposal_output_tokens: int
+    cycles_24h: int
+    failed_cycles_24h: int
+    draft_failures_24h: int
+    last_cycle_at: dt.datetime | None

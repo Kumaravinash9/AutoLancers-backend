@@ -14,6 +14,13 @@ class Settings(BaseSettings):
 
     token_encryption_key: str = ""
 
+    # Signs session cookies. Changing it invalidates every session, which is the intended
+    # emergency lever.
+    jwt_secret: str = ""
+    session_ttl_hours: int = 24 * 14
+    # Cookies are only marked Secure over HTTPS; leave false for local http development.
+    cookie_secure: bool = False
+
     # Which LLM drafts proposals: "gemini" or "anthropic".
     llm_provider: str = "gemini"
 

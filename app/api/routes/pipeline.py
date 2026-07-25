@@ -17,7 +17,7 @@ async def health() -> dict[str, str]:
 @router.post("/pipeline/run")
 async def run_once(session: AsyncSession = Depends(get_session)) -> dict[str, object]:
     """Trigger one ingest cycle by hand. Useful for testing without waiting for the poller."""
-    return (await run_cycle(session)).as_dict()
+    return (await run_cycle(session, trigger="manual")).as_dict()
 
 
 @router.post("/pipeline/prune")

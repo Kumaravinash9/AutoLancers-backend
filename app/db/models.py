@@ -7,6 +7,7 @@ multi-tenant retrofit never has to move rows or re-key credentials.
 from __future__ import annotations
 
 import datetime as dt
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
@@ -31,12 +32,35 @@ class Base(DeclarativeBase):
     pass
 
 
+class Role(StrEnum):
+    """Roles are a closed set, checked server-side on every request.
+
+    Kept deliberately coarse: an `admin` operates the platform, a `user` operates their own
+    account. Anything finer would be invented complexity until there are real teams.
+    """
+
+    USER = "user"
+    ADMIN = "admin"
+
+
 class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    email: Mapped[str] = mapped_column(String(320), unique=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    # bcrypt digest. Nullable so the pre-auth single-user row stays valid until it gets a password.
+    password_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    role: Mapped[str] = mapped_column(String(16), default=Role.USER, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    display_name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_login_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == Role.ADMIN
 
     tokens: Mapped[list[OAuthToken]] = relationship(back_populates="user")
     profile: Mapped[Profile | None] = relationship(back_populates="user", uselist=False)
@@ -112,6 +136,35 @@ class Profile(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="profile")
+
+
+class CycleRun(Base):
+    """One completed poll cycle.
+
+    Without this the poller is unobservable: you can't tell "no good jobs today" apart from
+    "discovery has been failing for six hours", and both look identical from the queue.
+    """
+
+    __tablename__ = "cycle_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+
+    started_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    fetched: Mapped[int] = mapped_column(Integer, default=0)
+    created: Mapped[int] = mapped_column(Integer, default=0)
+    updated: Mapped[int] = mapped_column(Integer, default=0)
+    rejected: Mapped[int] = mapped_column(Integer, default=0)
+    drafted: Mapped[int] = mapped_column(Integer, default=0)
+    draft_failures: Mapped[int] = mapped_column(Integer, default=0)
+
+    authenticated: Mapped[bool] = mapped_column(Boolean, default=False)
+    trigger: Mapped[str] = mapped_column(String(16), default="poll")  # poll | manual
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Job(Base):

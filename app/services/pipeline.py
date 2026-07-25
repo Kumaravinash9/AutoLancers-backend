@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
@@ -15,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.freelancer_oauth import OAuthError, get_valid_access_token
 from app.connectors.freelancer import FreelancerAPIError, FreelancerClient, JobPosting
-from app.db.models import Job, Profile, utcnow
+from app.db.models import CycleRun, Job, Profile, utcnow
 from app.services.drafting import DraftingError, draft_proposal
 from app.services.scoring import score_job
 from app.services.users import get_or_create_default_user, get_or_create_profile
@@ -45,7 +46,13 @@ class CycleReport:
         return self.__dict__.copy()
 
 
-async def run_cycle(session: AsyncSession) -> CycleReport:
+async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport:
+    """Run one cycle and record what happened.
+
+    The record is the point: from the queue alone, "nothing matched today" and "discovery has
+    been failing for six hours" look identical.
+    """
+    started = time.monotonic()
     report = CycleReport()
 
     user = await get_or_create_default_user(session)
@@ -86,6 +93,7 @@ async def run_cycle(session: AsyncSession) -> CycleReport:
     except FreelancerAPIError as exc:
         report.error = str(exc)
         logger.warning("Skipping cycle: %s", exc)
+        await _record(session, user.id, report, started, trigger)
         return report
 
     report.fetched = len(postings)
@@ -106,6 +114,8 @@ async def run_cycle(session: AsyncSession) -> CycleReport:
     await session.commit()
 
     report.drafted, report.draft_failures = await _draft_pending(session, user.id, profile)
+
+    await _record(session, user.id, report, started, trigger)
 
     logger.info(
         "Cycle: fetched=%d new=%d updated=%d drafted=%d draft_failures=%d",
@@ -266,3 +276,28 @@ def _to_posting(row: Job) -> JobPosting:
         bid_count=row.bid_count,
         posted_at=row.posted_at,
     )
+
+
+async def _record(
+    session: AsyncSession, user_id: int, report: CycleReport, started: float, trigger: str
+) -> None:
+    """Persist the cycle. A failure to record must never turn a good cycle into a bad one."""
+    try:
+        session.add(
+            CycleRun(
+                user_id=user_id,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                fetched=report.fetched,
+                created=report.new,
+                updated=report.updated,
+                rejected=report.rejected,
+                drafted=report.drafted,
+                draft_failures=report.draft_failures,
+                authenticated=report.authenticated,
+                trigger=trigger,
+                error=report.error,
+            )
+        )
+        await session.commit()
+    except Exception:
+        logger.exception("Could not record cycle run")
