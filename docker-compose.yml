@@ -1,0 +1,27 @@
+# Dedicated Postgres for automateLancers.
+#
+# Port 5434 on purpose: 5432 and 5433 are commonly already taken on this machine, and sharing an
+# instance with another project makes it too easy to point a migration at the wrong database.
+#
+#   docker compose up -d
+services:
+  postgres:
+    image: postgres:16
+    container_name: automatelancers-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: automatelancers
+    ports:
+      - "5434:5432"
+    volumes:
+      - automatelancers-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d automatelancers"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  automatelancers-pgdata:
