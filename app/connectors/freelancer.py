@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 API_BASE = "https://www.freelancer.com/api"
 ACTIVE_PROJECTS_PATH = "/projects/0.1/projects/active/"
 JOBS_PATH = "/projects/0.1/jobs/"
+BIDS_PATH = "/projects/0.1/bids/"
+SELF_PATH = "/users/0.1/self/"
 
 # Only for vocabulary Freelancer names differently enough that no amount of string matching gets
 # there — "llm" will never resolve to "Artificial Intelligence" on its own. Everything else
@@ -70,6 +72,62 @@ class FreelancerClient:
 
     def _headers(self) -> dict[str, str]:
         return {AUTH_HEADER: self.access_token} if self.access_token else {}
+
+    async def fetch_self_id(self) -> int:
+        """The authenticated user's own id, required as ``bidder_id`` when placing a bid.
+
+        The API will not infer it from the token — omitting it (or sending null, as the earlier
+        prototype did) is rejected.
+        """
+        payload = await self._get(f"{API_BASE}{SELF_PATH}", {})
+        user_id = (payload.get("result") or {}).get("id")
+        if not user_id:
+            raise FreelancerAPIError(f"Could not read own user id from {payload}")
+        return int(user_id)
+
+    async def submit_bid(
+        self,
+        project_id: int,
+        bidder_id: int,
+        amount: float,
+        period_days: int,
+        description: str,
+        milestone_percentage: int = 100,
+    ) -> str:
+        """Place a real bid. Returns Freelancer's bid id.
+
+        Nothing in the polling path calls this. It is reachable only from the explicit per-job
+        endpoint, which itself requires a confirmation flag — placing a bid should take a
+        deliberate act, not a default.
+        """
+        if not self.access_token:
+            raise FreelancerAPIError("Cannot bid without an access token")
+
+        payload = {
+            "project_id": project_id,
+            "bidder_id": bidder_id,
+            "amount": amount,
+            "period": period_days,
+            "description": description,
+            # Required for fixed-price projects; harmless on hourly.
+            "milestone_percentage": milestone_percentage,
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{API_BASE}{BIDS_PATH}", json=payload, headers=self._headers()
+            )
+
+        if response.status_code >= 400:
+            raise FreelancerAPIError(
+                f"Bid rejected ({response.status_code}): {response.text[:400]}"
+            )
+
+        result = (response.json() or {}).get("result") or {}
+        bid_id = result.get("id")
+        if not bid_id:
+            raise FreelancerAPIError(f"Bid response had no id: {response.text[:300]}")
+        return str(bid_id)
 
     async def fetch_skill_catalogue(self) -> dict[str, int]:
         """Return Freelancer's whole skill list as ``{lowercased name: id}``.

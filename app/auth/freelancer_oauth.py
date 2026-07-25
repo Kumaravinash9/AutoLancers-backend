@@ -27,8 +27,22 @@ from app.db.models import OAuthToken, utcnow
 AUTHORIZE_URL = "https://accounts.freelancer.com/oauth/authorise"
 TOKEN_URL = "https://accounts.freelancer.com/oauth/token"
 
-# Read-only. Never add "bid" here without a deliberate decision to enable submission.
+# Identity scope. Read-only on its own.
 DEFAULT_SCOPE = "basic"
+
+# Freelancer's advanced scope covering "manage your projects, bids and milestones". It travels in
+# a separate `advanced_scopes` parameter, not in `scope`, and is only granted to apps Freelancer
+# has approved for it — requesting it before approval fails at the consent screen.
+BID_SCOPE = "fln:project_manage"
+
+
+def has_bid_scope(scope: str | None) -> bool:
+    """Whether a stored token actually carries the bid permission.
+
+    Checked before every submission. A token minted under read-only scope must never be assumed
+    to have gained the capability just because config was flipped on.
+    """
+    return bool(scope) and BID_SCOPE in scope
 
 # Refresh this far ahead of actual expiry so a long request can't straddle the boundary.
 _REFRESH_MARGIN = dt.timedelta(minutes=5)
@@ -53,7 +67,11 @@ class TokenResponse:
 
 
 def build_authorize_url(state: str | None = None, scope: str = DEFAULT_SCOPE) -> tuple[str, str]:
-    """Return ``(url, state)``. Caller must persist ``state`` and check it on callback."""
+    """Return ``(url, state)``. Caller must persist ``state`` and check it on callback.
+
+    The bid scope is requested only when ``ENABLE_BIDDING`` is on, so a read-only install cannot
+    accidentally hold a permission it never intends to use.
+    """
     settings = get_settings()
     if not settings.freelancer_client_id:
         raise OAuthError("FREELANCER_CLIENT_ID is not set")
@@ -66,7 +84,7 @@ def build_authorize_url(state: str | None = None, scope: str = DEFAULT_SCOPE) ->
             "redirect_uri": settings.freelancer_redirect_uri,
             "scope": scope,
             "prompt": "select_account",
-            "advanced_scopes": "",
+            "advanced_scopes": BID_SCOPE if settings.enable_bidding else "",
             "state": state,
         }
     )

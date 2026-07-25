@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.6-flash"
 
+    # Master switch for placing real bids. Off by default and checked on every submission, so
+    # bidding cannot be reached by a stray request, a bad merge, or a UI bug — only by a
+    # deliberate config change plus a per-job confirmation.
+    enable_bidding: bool = False
+
     frontend_origin: str = "http://localhost:3000"
     poll_interval_seconds: int = 25
     scheduler_enabled: bool = True

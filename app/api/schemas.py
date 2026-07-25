@@ -29,11 +29,36 @@ class JobOut(BaseModel):
     proposal_text: str | None
     status: str
     first_seen_at: dt.datetime
+    bid_amount: float | None
+    bid_period_days: int | None
+    bid_submitted_at: dt.datetime | None
+    external_bid_id: str | None
 
 
 class JobPatch(BaseModel):
     proposal_text: str | None = None
+    # "submitted" is intentionally not settable here — it is only ever reached by actually
+    # placing a bid, so the status can't drift away from what happened on Freelancer.
     status: str | None = Field(default=None, pattern="^(new|drafted|approved|dismissed)$")
+
+
+class BidRequest(BaseModel):
+    amount: float = Field(gt=0)
+    period_days: int = Field(default=7, gt=0, le=365)
+    milestone_percentage: int = Field(default=100, ge=1, le=100)
+    # No default: placing a bid must be an explicit act, never the consequence of a bare POST.
+    confirm: bool
+
+
+class BidResult(BaseModel):
+    bid_id: str
+    amount: float
+    period_days: int
+
+
+class BidAvailabilityOut(BaseModel):
+    available: bool
+    reason: str
 
 
 class SkillIn(BaseModel):

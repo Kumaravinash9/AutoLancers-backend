@@ -4,9 +4,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.schemas import JobOut, JobPatch
-from app.db.models import Job
+from app.api.schemas import BidAvailabilityOut, BidRequest, BidResult, JobOut, JobPatch
+from app.db.models import Job, OAuthToken
 from app.db.session import get_session
+from app.services.bidding import (
+    BidAvailability,
+    BiddingError,
+    check_availability,
+    submit_bid_for_job,
+)
 from app.services.pipeline import rescore_all
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
@@ -44,9 +50,50 @@ async def rescore(session: AsyncSession = Depends(get_session)) -> dict[str, int
     return {"rescored": await rescore_all(session, user.id, profile)}
 
 
+@router.get("/bid-availability", response_model=BidAvailabilityOut)
+async def bid_availability(session: AsyncSession = Depends(get_session)) -> BidAvailability:
+    """Whether bidding is usable, and if not why — so the UI can explain, not just grey out."""
+    user = await get_or_create_default_user(session)
+    token_row = await session.scalar(
+        select(OAuthToken).where(
+            OAuthToken.user_id == user.id, OAuthToken.platform == "freelancer"
+        )
+    )
+    return check_availability(token_row)
+
+
 @router.get("/{job_id}", response_model=JobOut)
 async def get_job(job_id: int, session: AsyncSession = Depends(get_session)) -> Job:
     return await _owned_job(session, job_id)
+
+
+@router.post("/{job_id}/bid", response_model=BidResult)
+async def place_bid(
+    job_id: int, request: BidRequest, session: AsyncSession = Depends(get_session)
+) -> BidResult:
+    """Place a real bid on Freelancer.com.
+
+    The only path in this codebase that submits anything. Requires `confirm: true` in the body on
+    top of the install-level switch and the token's scope.
+    """
+    user = await get_or_create_default_user(session)
+    job = await _owned_job(session, job_id)
+
+    try:
+        bid_id = await submit_bid_for_job(
+            session,
+            user.id,
+            job,
+            amount=request.amount,
+            period_days=request.period_days,
+            confirm=request.confirm,
+            milestone_percentage=request.milestone_percentage,
+        )
+    except BiddingError as exc:
+        # 409: the request was well-formed, the current state just doesn't permit it.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return BidResult(bid_id=bid_id, amount=request.amount, period_days=request.period_days)
 
 
 @router.patch("/{job_id}", response_model=JobOut)

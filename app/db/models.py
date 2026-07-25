@@ -155,8 +155,18 @@ class Job(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    # new -> drafted -> approved | dismissed. No "submitted": v1 never submits.
+    # new -> drafted -> approved | dismissed | submitted.
+    # "submitted" is only ever reached through an explicit per-job confirmation.
     status: Mapped[str] = mapped_column(String(16), default="new", index=True)
+
+    # Set only when a bid was actually placed through the API. `external_bid_id` is Freelancer's
+    # id for it, which is what makes a duplicate submission detectable rather than merely unlikely.
+    bid_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bid_period_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bid_submitted_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    external_bid_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     first_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     refreshed_at: Mapped[dt.datetime] = mapped_column(
