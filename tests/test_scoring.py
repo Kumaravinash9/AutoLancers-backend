@@ -138,6 +138,54 @@ class TestScoring:
         comp_heavy = score_job(job, make_profile(weight_skills=10, weight_competition=80), now=NOW)
         assert skills_heavy.score != comp_heavy.score
 
+    def test_secondary_skills_do_not_drag_down_a_strong_match(self):
+        """A long tail of secondary skills must not dilute a job that hits your core ones.
+
+        Normalising by the whole profile would mean a Next.js job scores lower purely because you
+        also happen to list six other things — under that model, being honest about your range
+        makes every job look worse, which is backwards.
+        """
+        core = [{"name": "next.js", "weight": 5}, {"name": "react", "weight": 5}]
+        tail = [
+            {"name": name, "weight": 1}
+            for name in ("wordpress", "flutter", "rust", "solidity", "figma", "excel")
+        ]
+        job = make_job(
+            title="Next.js and React dashboard",
+            description="Build a dashboard in next.js and react.",
+            skills_listed=["Next.js", "React"],
+        )
+
+        narrow = score_job(job, make_profile(skills=core), now=NOW).score
+        broad = score_job(job, make_profile(skills=core + tail), now=NOW).score
+
+        # Some dilution is legitimate — with more skills listed, a three-skill job could have
+        # matched more of them. What matters is that it stays mild. The old whole-profile
+        # normalisation put this at roughly a third of the narrow score.
+        assert broad >= narrow * 0.9, f"broad profile scored {broad} vs {narrow} for the same job"
+
+    def test_matching_a_few_of_many_skills_still_scores_well(self):
+        """Matching 3 of 9 skills is a strong fit, not a 33% one — no job asks for everything."""
+        profile = make_profile(
+            skills=[
+                {"name": "next.js", "weight": 5},
+                {"name": "react", "weight": 5},
+                {"name": "node", "weight": 4},
+                *[
+                    {"name": n, "weight": 4}
+                    for n in ("python", "fastapi", "ai", "llm", "chatbot", "automation")
+                ],
+            ]
+        )
+        job = make_job(
+            title="Next.js dashboard",
+            description="Next.js and react front end with a node backend.",
+            skills_listed=["Next.js", "React", "Node.js"],
+        )
+        result = score_job(job, profile, now=NOW)
+        skills_points = next(r["points"] for r in result.reasons if r["label"] == "Skills matched")
+        assert skills_points >= profile.weight_skills * 0.9
+
     def test_all_zero_weights_is_rejected_not_a_crash(self):
         profile = make_profile(
             weight_skills=0, weight_budget=0, weight_competition=0, weight_recency=0

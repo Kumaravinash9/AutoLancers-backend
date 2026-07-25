@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,6 +20,22 @@ logger = logging.getLogger(__name__)
 
 API_BASE = "https://www.freelancer.com/api"
 ACTIVE_PROJECTS_PATH = "/projects/0.1/projects/active/"
+JOBS_PATH = "/projects/0.1/jobs/"
+
+# Only for vocabulary Freelancer names differently enough that no amount of string matching gets
+# there — "llm" will never resolve to "Artificial Intelligence" on its own. Everything else
+# (react -> React.js, chatbot -> AI Chatbot) is handled by the word-boundary fallback below.
+SKILL_ALIASES = {
+    "ai": "artificial intelligence",
+    "llm": "artificial intelligence",
+    "genai": "artificial intelligence",
+    "rag": "artificial intelligence",
+    "ml": "machine learning (ml)",
+    "js": "javascript",
+    "ts": "typescript",
+    "postgres": "postgresql",
+    "automation": "api development",
+}
 
 # Freelancer uses its own auth header, not `Authorization: Bearer`.
 AUTH_HEADER = "freelancer-oauth-v1"
@@ -54,14 +71,58 @@ class FreelancerClient:
     def _headers(self) -> dict[str, str]:
         return {AUTH_HEADER: self.access_token} if self.access_token else {}
 
+    async def fetch_skill_catalogue(self) -> dict[str, int]:
+        """Return Freelancer's whole skill list as ``{lowercased name: id}``.
+
+        The catalogue is large but effectively static, so callers should cache it rather than
+        refetch every cycle.
+        """
+        response = await self._get(f"{API_BASE}{JOBS_PATH}", {"limit": 2000})
+        entries = response.get("result") or []
+        return {e["name"].lower(): e["id"] for e in entries if e.get("name") and e.get("id")}
+
+    async def resolve_skill_ids(self, names: list[str]) -> tuple[list[int], list[str]]:
+        """Map profile skill names onto Freelancer skill IDs.
+
+        Returns ``(ids, unmatched_names)``. Unmatched names are handed back rather than silently
+        dropped — a typo'd or non-existent skill quietly narrowing your search is exactly the kind
+        of failure that looks like "the tool found nothing good today".
+        """
+        catalogue = await self.fetch_skill_catalogue()
+        ids: list[int] = []
+        unmatched: list[str] = []
+
+        for raw in names:
+            name = raw.strip().lower()
+            if not name:
+                continue
+
+            candidate = catalogue.get(name)
+            if candidate is None:
+                candidate = catalogue.get(SKILL_ALIASES.get(name, ""))
+            if candidate is None:
+                candidate = _closest_skill(catalogue, name)
+
+            if candidate is None:
+                unmatched.append(raw)
+            elif candidate not in ids:
+                ids.append(candidate)
+
+        return ids, unmatched
+
     async def search_active_projects(
         self,
         query: str | None = None,
+        skill_ids: list[int] | None = None,
         limit: int = 50,
         project_types: tuple[str, ...] = ("fixed", "hourly"),
         max_retries: int = 3,
     ) -> list[JobPosting]:
         """Fetch active projects, retrying transient failures with exponential backoff.
+
+        Pass ``skill_ids`` to filter server-side by skill. Without it this returns whatever was
+        posted most recently across the whole marketplace, which for a specialist profile is
+        almost entirely noise.
 
         Raises on permanent failures (4xx other than 429); the caller decides whether one bad
         cycle should be logged and skipped.
@@ -71,11 +132,25 @@ class FreelancerClient:
             "full_description": "true",
             "job_details": "true",
             "project_types[]": list(project_types),
+            # Newest first. Bid counts on Freelancer climb fast — postings routinely pass 40 bids
+            # within a couple of hours — so getting there early is most of the advantage.
+            "sort_field": "time_submitted",
         }
         if query:
             params["query"] = query
+        if skill_ids:
+            params["jobs[]"] = skill_ids
 
-        url = f"{API_BASE}{ACTIVE_PROJECTS_PATH}"
+        payload = await self._get(
+            f"{API_BASE}{ACTIVE_PROJECTS_PATH}", params, max_retries=max_retries
+        )
+        projects = (payload.get("result") or {}).get("projects") or []
+        return [normalize_project(p) for p in projects]
+
+    async def _get(
+        self, url: str, params: dict[str, Any], max_retries: int = 3
+    ) -> dict[str, Any]:
+        """GET with exponential backoff on 429 and 5xx. Raises on permanent failures."""
         delay = 1.0
 
         for attempt in range(1, max_retries + 1):
@@ -110,9 +185,7 @@ class FreelancerClient:
                     f"Freelancer API returned {response.status_code}: {response.text[:400]}"
                 )
 
-            payload = response.json()
-            projects = (payload.get("result") or {}).get("projects") or []
-            return [normalize_project(p) for p in projects]
+            return response.json()
 
         raise FreelancerAPIError("Exhausted retries without a response")
 
@@ -156,6 +229,21 @@ def normalize_project(raw: dict[str, Any]) -> JobPosting:
         bid_count=_as_int(bid_stats.get("bid_count")),
         posted_at=posted_at,
     )
+
+
+def _closest_skill(catalogue: dict[str, int], term: str) -> int | None:
+    """Best catalogue entry containing ``term`` as a whole word, or None.
+
+    Freelancer qualifies most skill names ("React.js", "AI Chatbot"), so an exact lookup on what
+    someone types into a profile usually misses. Requiring a word boundary keeps "api" from
+    matching "Rapid Prototyping", and preferring the shortest match picks the canonical entry —
+    "React.js" over "React Native", "AI Chatbot" over "AI Chatbot Development".
+    """
+    pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)")
+    matches = [name for name in catalogue if pattern.search(name)]
+    if not matches:
+        return None
+    return catalogue[min(matches, key=len)]
 
 
 def _as_float(value: Any) -> float | None:

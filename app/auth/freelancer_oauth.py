@@ -1,7 +1,10 @@
 """Freelancer.com OAuth 2.0 — authorization code grant with refresh tokens.
 
-App registration is self-service at https://accounts.freelancer.com/settings/create_app; a client
-ID and secret are issued immediately with no approval queue.
+Register an app at https://accounts.freelancer.com/settings/develop (you must be logged in first).
+Note the path is ``/settings/develop`` — ``/settings/create_app`` is a 404.
+
+Connecting an account is **optional**: project discovery works unauthenticated, and a token only
+buys richer fields and higher rate limits.
 
 v1 requests read scope only. The ``bid`` scope is deliberately not requested — nothing in this
 codebase submits a bid, and not holding the capability is a stronger guarantee than not using it.

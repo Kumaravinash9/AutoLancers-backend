@@ -22,6 +22,10 @@ from app.db.models import Profile, utcnow
 # Anything older than this scores zero on recency.
 RECENCY_HORIZON_HOURS = 48.0
 
+# How many of your strongest skills a job has to hit to earn full marks on the skills component.
+# No single posting asks for everything you do, so full credit has to be reachable.
+SKILL_SATURATION_COUNT = 3
+
 
 @dataclass
 class ScoreResult:
@@ -122,13 +126,18 @@ def _score_skills(
     if not skills or weight <= 0:
         return 0.0
 
-    total = sum(float(s.get("weight", 1)) for s in skills)
-    if total <= 0:
+    # Score against what a single job could plausibly ask for, not against your whole skill list.
+    # Normalising by the total would punish having broad skills: a Python/FastAPI/AI job would
+    # score 33% simply because you also happen to list Next.js and React. The target is the sum
+    # of your top few weights, so matching a few strong skills earns full marks.
+    weights = sorted((float(s.get("weight", 1)) for s in skills), reverse=True)
+    target = sum(weights[:SKILL_SATURATION_COUNT])
+    if target <= 0:
         return 0.0
 
     matched = [s for s in skills if _contains_term(haystack, s["name"])]
     matched_weight = sum(float(s.get("weight", 1)) for s in matched)
-    earned = matched_weight / total * weight
+    earned = min(1.0, matched_weight / target) * weight
 
     if matched:
         names = ", ".join(s["name"] for s in matched)

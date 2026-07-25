@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,6 +37,8 @@ class CycleReport:
     rejected: int = 0
     drafted: int = 0
     draft_failures: int = 0
+    authenticated: bool = True
+    unmatched_skills: list[str] = field(default_factory=list)
     error: str | None = None
 
     def as_dict(self) -> dict[str, object]:
@@ -49,15 +51,38 @@ async def run_cycle(session: AsyncSession) -> CycleReport:
     user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
+    # A token is optional. The public project search works unauthenticated — it just returns
+    # fewer fields and has lower rate limits — so an unconnected account degrades to reduced
+    # discovery rather than no product at all.
     try:
         token = await get_valid_access_token(session, user.id)
     except OAuthError as exc:
-        report.error = str(exc)
-        logger.warning("Skipping cycle: %s", exc)
-        return report
+        token = None
+        report.authenticated = False
+        logger.info("Running unauthenticated: %s", exc)
+
+    client = FreelancerClient(access_token=token)
+
+    # Filter server-side by the profile's skills. Without this the search returns whatever was
+    # posted most recently across the entire marketplace, which for a specialist profile is
+    # overwhelmingly irrelevant — you end up scoring logo and SEO gigs against a Next.js profile.
+    skill_ids: list[int] = []
+    try:
+        names = [s["name"] for s in (profile.skills or []) if s.get("name")]
+        if names:
+            skill_ids, unmatched = await client.resolve_skill_ids(names)
+            report.unmatched_skills = unmatched
+            if unmatched:
+                logger.info(
+                    "Profile skills with no Freelancer equivalent (ignored in search): %s",
+                    ", ".join(unmatched),
+                )
+    except FreelancerAPIError as exc:
+        # Losing the catalogue is not fatal — fall back to an unfiltered search.
+        logger.warning("Could not resolve skill filters, searching unfiltered: %s", exc)
 
     try:
-        postings = await FreelancerClient(access_token=token).search_active_projects()
+        postings = await client.search_active_projects(skill_ids=skill_ids or None)
     except FreelancerAPIError as exc:
         report.error = str(exc)
         logger.warning("Skipping cycle: %s", exc)
