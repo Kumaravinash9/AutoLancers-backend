@@ -11,9 +11,9 @@ The frontend lives in a separate repo: `automateLancers-frontend`.
 ## Requirements
 
 - Python 3.12+
-- PostgreSQL 14+
+- PostgreSQL 14+ (a `docker compose` file is included)
 - A Freelancer.com OAuth app (self-service at https://accounts.freelancer.com/settings/create_app)
-- An Anthropic API key
+- A Gemini API key from https://aistudio.google.com/apikey (or an Anthropic key — see below)
 
 ## Setup
 
@@ -52,6 +52,30 @@ uv run uvicorn app.main:app --reload --port 8010
 
 The poller starts with the app and runs every `POLL_INTERVAL_SECONDS` (default 25s).
 `POST /pipeline/run` triggers a single cycle by hand.
+
+## Proposal drafting
+
+Drafts are written by an LLM, selected with `LLM_PROVIDER`:
+
+| Provider | Setting | Default model |
+|---|---|---|
+| Google Gemini (default) | `LLM_PROVIDER=gemini` + `GEMINI_API_KEY` | `gemini-3.6-flash` |
+| Anthropic | `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | `claude-opus-5` |
+
+The prompt (`app/prompts/proposal_system.md`) is provider-neutral, so switching is a config change.
+It is sourced from the `freelancer-proposal` skill: the six-beat flow, the 120–180 word limit, the
+conversion rules, and the honesty guardrail (never invent numbers or claims).
+
+**Both current model families think before answering, and that thinking is drawn from the same
+output budget as the reply.** On real postings a ~150-word proposal costs ~200 visible tokens but
+over 1,200 thinking tokens, so `MAX_OUTPUT_TOKENS` is deliberately generous — sizing it for the
+visible text alone returns an empty draft. Thinking tokens are counted into the stored
+`proposal_output_tokens` so cost per bid isn't understated.
+
+**Free-tier Gemini has per-minute and per-day request limits.** The pipeline drafts at most
+`MAX_DRAFTS_PER_CYCLE` (5) per cycle, and a rate-limited draft is logged and retried next cycle
+rather than lost — but on a busy day the free tier can still be the binding constraint. Lower
+`POLL_INTERVAL_SECONDS` cautiously.
 
 ## Test
 

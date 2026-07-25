@@ -1,9 +1,12 @@
-"""Proposal drafting via the Claude API.
+"""Proposal drafting.
 
 The system prompt lives in ``app/prompts/proposal_system.md`` and is sourced from the
 ``freelancer-proposal`` skill — the six-beat flow, the 120-180 word limit, the conversion rules,
 and the honesty guardrail. Your identity is injected as a structured data block rather than prose
 so the model treats it as facts to use, not text to imitate.
+
+Two providers are supported, selected by ``LLM_PROVIDER``: Gemini (default) and Anthropic. The
+prompt is provider-neutral, so switching is a config change rather than a rewrite.
 
 Failures here must never take down the poll loop: a rate limit or a 500 leaves the job undrafted
 and the next cycle picks it up again.
@@ -16,7 +19,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-import anthropic
+import httpx
 
 from app.config import get_settings
 from app.connectors.freelancer import JobPosting
@@ -24,19 +27,16 @@ from app.db.models import Profile
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-opus-5"
-
-# Thinking is on by default on this model and max_tokens caps thinking *plus* response text, so a
-# budget sized for a 180-word proposal would truncate mid-sentence. Only generated tokens are
-# billed, so the headroom is free.
-MAX_TOKENS = 8000
-
-# A proposal is a short, well-specified generation. Low effort is strong here and keeps both
-# latency and cost per bid down; raise it if drafts start feeling generic.
-EFFORT = "low"
+# Current Gemini and Claude models both think before answering, and that thinking is drawn from
+# the same output budget as the reply. Measured against real postings, a ~150-word proposal costs
+# ~200 output tokens but over 1,200 thinking tokens — a budget sized for the visible text alone
+# silently returns nothing. Only generated tokens are billed, so the headroom is free.
+MAX_OUTPUT_TOKENS = 8000
 
 # Long posts add cost without improving the draft; the first ~6k characters carry the brief.
 DESCRIPTION_LIMIT = 6000
+
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "proposal_system.md"
 
@@ -58,29 +58,98 @@ def _system_prompt() -> str:
     return _PROMPT_PATH.read_text(encoding="utf-8")
 
 
-@lru_cache
-def _client() -> anthropic.AsyncAnthropic:
+async def draft_proposal(job: JobPosting, profile: Profile) -> Draft:
+    """Draft one proposal. Raises ``DraftingError``; callers are expected to catch and continue."""
+    settings = get_settings()
+    message = _build_user_message(job, profile)
+
+    if settings.llm_provider == "gemini":
+        return await _draft_with_gemini(message)
+    if settings.llm_provider == "anthropic":
+        return await _draft_with_anthropic(message)
+    raise DraftingError(
+        f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected 'gemini' or 'anthropic'"
+    )
+
+
+async def _draft_with_gemini(message: str) -> Draft:
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise DraftingError("GEMINI_API_KEY is not set")
+
+    payload = {
+        "systemInstruction": {"parts": [{"text": _system_prompt()}]},
+        "contents": [{"role": "user", "parts": [{"text": message}]}],
+        "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS, "temperature": 0.7},
+    }
+
+    url = GEMINI_ENDPOINT.format(model=settings.gemini_model)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                url,
+                params={"key": settings.gemini_api_key},
+                json=payload,
+                headers={"content-type": "application/json"},
+            )
+    except httpx.HTTPError as exc:
+        raise DraftingError(f"Could not reach the Gemini API: {exc}") from exc
+
+    if response.status_code >= 400:
+        # The key is in the query string, so keep it out of logs and error text.
+        raise DraftingError(f"Gemini API returned {response.status_code}: {response.text[:300]}")
+
+    data = response.json()
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        blocked = (data.get("promptFeedback") or {}).get("blockReason")
+        suffix = f" (blocked: {blocked})" if blocked else ""
+        raise DraftingError(f"Gemini returned no candidates{suffix}")
+
+    candidate = candidates[0]
+    finish = candidate.get("finishReason")
+    parts = (candidate.get("content") or {}).get("parts") or []
+    text = "".join(part.get("text", "") for part in parts).strip()
+
+    if not text:
+        # The usual cause is the whole budget going to thinking tokens.
+        raise DraftingError(f"Gemini returned an empty draft (finishReason={finish})")
+    if finish == "MAX_TOKENS":
+        raise DraftingError("Gemini hit the output limit — the draft would be truncated")
+
+    usage = data.get("usageMetadata") or {}
+    return Draft(
+        text=text,
+        model=data.get("modelVersion") or settings.gemini_model,
+        input_tokens=usage.get("promptTokenCount"),
+        # Thinking is billed but not returned; count it so cost per bid is honest.
+        output_tokens=(usage.get("candidatesTokenCount") or 0)
+        + (usage.get("thoughtsTokenCount") or 0),
+    )
+
+
+async def _draft_with_anthropic(message: str) -> Draft:
     settings = get_settings()
     if not settings.anthropic_api_key:
         raise DraftingError("ANTHROPIC_API_KEY is not set")
-    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+    # Imported lazily so the Gemini path doesn't require the SDK to be installed.
+    import anthropic
 
-async def draft_proposal(job: JobPosting, profile: Profile) -> Draft:
-    """Draft one proposal. Raises ``DraftingError``; callers are expected to catch and continue."""
-    message = _build_user_message(job, profile)
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     try:
-        response = await _client().messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
+        response = await client.messages.create(
+            model=settings.anthropic_model,
+            max_tokens=MAX_OUTPUT_TOKENS,
             thinking={"type": "adaptive"},
-            output_config={"effort": EFFORT},
+            output_config={"effort": "low"},
             system=[
                 {
                     "type": "text",
                     "text": _system_prompt(),
-                    # The system prompt is byte-identical across every job, so it caches.
+                    # Byte-identical across every job, so it caches.
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
