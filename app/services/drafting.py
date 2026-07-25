@@ -25,7 +25,15 @@ from app.db.models import Profile
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-opus-5"
-MAX_TOKENS = 1200
+
+# Thinking is on by default on this model and max_tokens caps thinking *plus* response text, so a
+# budget sized for a 180-word proposal would truncate mid-sentence. Only generated tokens are
+# billed, so the headroom is free.
+MAX_TOKENS = 8000
+
+# A proposal is a short, well-specified generation. Low effort is strong here and keeps both
+# latency and cost per bid down; raise it if drafts start feeling generic.
+EFFORT = "low"
 
 # Long posts add cost without improving the draft; the first ~6k characters carry the brief.
 DESCRIPTION_LIMIT = 6000
@@ -67,7 +75,7 @@ async def draft_proposal(job: JobPosting, profile: Profile) -> Draft:
             model=MODEL,
             max_tokens=MAX_TOKENS,
             thinking={"type": "adaptive"},
-            output_config={"effort": "medium"},
+            output_config={"effort": EFFORT},
             system=[
                 {
                     "type": "text",
