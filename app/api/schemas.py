@@ -374,3 +374,24 @@ class SelectionIn(BaseModel):
     """Which account to scope the app to. ``None`` means all of them."""
 
     connection_id: uuid.UUID | None = None
+
+
+class DemoRequestIn(BaseModel):
+    """A demo request from the marketing page. Public — no account required."""
+
+    name: str = Field(min_length=1, max_length=255)
+    email: str = Field(min_length=3, max_length=320)
+    note: str | None = Field(default=None, max_length=2000)
+    marketplace: str | None = Field(default=None, max_length=50)
+
+
+class DemoRequestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    email: str
+    note: str | None
+    marketplace: str | None
+    handled: bool
+    created_at: dt.datetime

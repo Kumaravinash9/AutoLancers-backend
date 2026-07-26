@@ -596,3 +596,25 @@ class CycleRun(Base):
     authenticated: Mapped[bool] = mapped_column(Boolean, default=False)
     trigger: Mapped[str] = mapped_column(String(16), default="poll")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DemoRequest(Base):
+    """Someone asking for a walkthrough from the marketing page.
+
+    Deliberately not a ``User``: they have no account and may never make one. Storing the ask
+    means a request that arrives while nobody is watching is still there tomorrow — a mailto link
+    to an unmonitored address loses it silently.
+    """
+
+    __tablename__ = "demo_requests"
+
+    id: Mapped[uuid.UUID] = _pk()
+    name: Mapped[str] = mapped_column(String(255))
+    email: Mapped[str] = mapped_column(String(255), index=True)
+    # What they work on and what they want to see. Free text, because a dropdown here would guess
+    # at categories we have no evidence for yet.
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    marketplace: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    handled: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
