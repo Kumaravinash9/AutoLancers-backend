@@ -22,6 +22,7 @@ API_BASE = "https://www.freelancer.com/api"
 ACTIVE_PROJECTS_PATH = "/projects/0.1/projects/active/"
 JOBS_PATH = "/projects/0.1/jobs/"
 BIDS_PATH = "/projects/0.1/bids/"
+PROJECTS_BY_ID_PATH = "/projects/0.1/projects/"
 SELF_PATH = "/users/0.1/self/"
 
 # Only for vocabulary Freelancer names differently enough that no amount of string matching gets
@@ -128,6 +129,38 @@ class FreelancerClient:
         if not bid_id:
             raise FreelancerAPIError(f"Bid response had no id: {response.text[:300]}")
         return str(bid_id)
+
+    async def fetch_my_bids(self, bidder_id: int, limit: int = 100) -> list[dict[str, Any]]:
+        """Every bid this account has placed, including ones made outside this tool.
+
+        Returned raw: the mapping onto our own rows is a decision for the sync service, not the
+        transport.
+        """
+        payload = await self._get(
+            f"{API_BASE}{BIDS_PATH}",
+            {"bidders[]": [bidder_id], "limit": limit, "compact": "false"},
+        )
+        result = payload.get("result") or {}
+        return list(result.get("bids") or [])
+
+    async def fetch_projects_by_id(self, project_ids: list[int]) -> dict[str, JobPosting]:
+        """Fetch specific projects by id, keyed by external id.
+
+        Needed because a bid can point at a project we never saw — placed before this tool
+        existed, or on work outside the profile's skill filter.
+        """
+        if not project_ids:
+            return {}
+        payload = await self._get(
+            f"{API_BASE}{PROJECTS_BY_ID_PATH}",
+            {
+                "projects[]": project_ids,
+                "full_description": "true",
+                "job_details": "true",
+            },
+        )
+        projects = (payload.get("result") or {}).get("projects") or []
+        return {str(p.get("id")): normalize_project(p) for p in projects if p.get("id")}
 
     async def fetch_skill_catalogue(self) -> dict[str, int]:
         """Return Freelancer's whole skill list as ``{lowercased name: id}``.

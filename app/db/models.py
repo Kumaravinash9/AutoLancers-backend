@@ -234,6 +234,11 @@ class FreelancerProfile(Base):
     last_synced_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # When their real bids were last pulled back from the marketplace. Null means no outcome has
+    # ever been checked, which is why the UI must not report zero wins as a result.
+    bids_synced_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(30), default="ACTIVE")
 
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

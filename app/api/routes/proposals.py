@@ -22,6 +22,7 @@ from app.db.models import (
     User,
 )
 from app.db.session import get_session
+from app.services.bid_sync import sync_bids
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
 router = APIRouter(prefix="/proposals", tags=["proposals"])
@@ -119,9 +120,9 @@ async def stats(session: AsyncSession = Depends(get_session)) -> ProposalStats:
     )
 
     return ProposalStats(
-        # No award-status sync exists yet, so every sent bid is awaiting an outcome we have not
-        # asked for. See the outcome-tracking note in the README.
-        outcome_tracking_enabled=False,
+        # True only once bids have actually been pulled back: before that, zero wins means we
+        # never asked, not that you lost.
+        outcome_tracking_enabled=profile.bids_synced_at is not None,
         awaiting_outcome=await count(Proposal.status == ProposalStatus.SUBMITTED),
         from_recommendation=await count(Proposal.recommendation_id.is_not(None)),
         self_directed=await count(Proposal.recommendation_id.is_(None)),
@@ -134,3 +135,15 @@ async def stats(session: AsyncSession = Depends(get_session)) -> ProposalStats:
         avg_score_accepted=await avg_score(Proposal.status == ProposalStatus.ACCEPTED),
         total_output_tokens=int(tokens or 0),
     )
+
+
+@router.post("/sync")
+async def sync(session: AsyncSession = Depends(get_session)) -> dict[str, object]:
+    """Pull real bids and their award status back from Freelancer.
+
+    This is the only source of truth for whether you were selected — nothing else in the system
+    can know that.
+    """
+    user = await get_or_create_default_user(session)
+    profile = await get_or_create_profile(session, user.id)
+    return (await sync_bids(session, user.id, profile)).as_dict()
