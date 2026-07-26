@@ -107,7 +107,7 @@ class TestWorthMatching:
 
 
 class TestFetchNewPostings:
-    async def test_stops_on_a_short_page(self, monkeypatch):
+    async def test_stops_on_an_empty_page(self, monkeypatch):
         monkeypatch.setattr(pipeline, "DISCOVERY_PAGE_SIZE", 2)
         client = FakeClient(_postings(3))
 
@@ -115,7 +115,9 @@ class TestFetchNewPostings:
 
         assert len(postings) == 3
         assert truncated is False
-        assert [c["offset"] for c in client.calls] == [0, 2]  # second page was short → stop
+        # Offset advances by rows actually returned (2, then 1), and only the empty page at 3 stops
+        # it — a short-but-nonempty page must not be read as "done" (Freelancer caps a page at ~50).
+        assert [c["offset"] for c in client.calls] == [0, 2, 3]
 
     async def test_page_cap_reports_truncation(self, monkeypatch):
         monkeypatch.setattr(pipeline, "DISCOVERY_PAGE_SIZE", 2)
