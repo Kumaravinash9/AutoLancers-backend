@@ -264,3 +264,64 @@ class ProposalStats(BaseModel):
     # dashboard and one that implies it lost work it simply never heard about.
     outcome_tracking_enabled: bool = False
     awaiting_outcome: int
+
+
+class ConnectionOut(BaseModel):
+    """A marketplace this profile is linked to."""
+
+    platform: str
+    platform_username: str | None
+    scope: str | None
+    rating: float | None
+    total_reviews: int | None
+    status: str
+    connected_at: dt.datetime | None
+    last_synced_at: dt.datetime | None
+
+
+class ProfileCard(BaseModel):
+    """Summary for the browse view — enough to recognise a profile, not enough to edit it."""
+
+    id: uuid.UUID
+    display_name: str
+    headline: str
+    profile_image: str | None
+    initials: str
+    skills: list[str]
+    skill_count: int
+    rate_min: float
+    rate_max: float
+    currency: str
+    availability: str
+    status: str
+    platforms: list[str]
+    last_synced_at: dt.datetime | None
+    bids_synced_at: dt.datetime | None
+    recommendations: int
+    proposals: int
+    wins: int
+
+
+class ProfileDetail(ProfileCard):
+    """Everything, for the opened profile."""
+
+    bio: str
+    weighted_skills: list[dict[str, Any]]
+    portfolio: list[dict[str, Any]]
+    experience: list[dict[str, Any]]
+    education: list[dict[str, Any]]
+    keywords_include: list[str]
+    keywords_exclude: list[str]
+    fixed_project_min: float
+    max_existing_bids: int
+    min_match_score: float
+    weight_skills: float
+    weight_budget: float
+    weight_competition: float
+    weight_recency: float
+    proposal_notes: str
+    connections: list[ConnectionOut]
+    avg_score: float | None
+    bids_synced_at: dt.datetime | None
+    created_at: dt.datetime
+    updated_at: dt.datetime
