@@ -135,3 +135,18 @@ fails on any database with rows in it.
 Still to adopt from the target schema: UUID primary keys, and splitting `projects` (one row per
 posting) from `recommendations` (one row per user per posting). Today `jobs` merges the two, which
 means a posting is stored once per user — fine for one user, wasteful for a thousand.
+
+## Bid outcomes are not tracked yet
+
+`ProposalStatus` has `ACCEPTED` and `REJECTED`, but **no code path sets them**. The pipeline
+writes `DRAFT`, the bidding service writes `SUBMITTED`, and that is the end of what this system
+knows. A sent bid's result is genuinely unknown to us, not pending.
+
+That matters for the calibration figures on `/proposals`: comparing average score sent against
+average score won is only meaningful once outcomes are real. Until then the API reports
+`outcome_tracking_enabled: false` and the UI shows a dash rather than a zero, because "0 selected"
+reads as "you lost them all" when the truth is "we never asked".
+
+Making it real means polling Freelancer for award status — `GET /projects/0.1/bids/?bidders[]=<id>`
+returns your bids with an award state — and mapping that onto the stored proposals. That needs a
+working connection with the appropriate scope.

@@ -258,3 +258,9 @@ class ProposalStats(BaseModel):
     # Split by origin, so the score is judged only on the bids it actually drove.
     from_recommendation: int
     self_directed: int
+
+    # Nothing currently syncs outcomes back from the marketplace, so a sent bid's result is
+    # genuinely unknown rather than pending. Saying so is the difference between an honest
+    # dashboard and one that implies it lost work it simply never heard about.
+    outcome_tracking_enabled: bool = False
+    awaiting_outcome: int

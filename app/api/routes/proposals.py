@@ -119,6 +119,10 @@ async def stats(session: AsyncSession = Depends(get_session)) -> ProposalStats:
     )
 
     return ProposalStats(
+        # No award-status sync exists yet, so every sent bid is awaiting an outcome we have not
+        # asked for. See the outcome-tracking note in the README.
+        outcome_tracking_enabled=False,
+        awaiting_outcome=await count(Proposal.status == ProposalStatus.SUBMITTED),
         from_recommendation=await count(Proposal.recommendation_id.is_not(None)),
         self_directed=await count(Proposal.recommendation_id.is_(None)),
         total=await count(),
