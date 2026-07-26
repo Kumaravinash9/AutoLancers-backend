@@ -79,6 +79,7 @@ class SkillIn(BaseModel):
 class ProfileOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+
     display_name: str
     headline: str
     skills: list[dict[str, Any]]
@@ -94,6 +95,15 @@ class ProfileOut(BaseModel):
     weight_competition: float
     weight_recency: float
     proposal_notes: str
+
+    # When the board was last recalculated against the marketplace, and when the profile itself
+    # was last edited. A profile that drifts out of date is the quiet failure mode here: the
+    # scores stay confident while the thing they were computed from has moved on.
+    last_synced_at: dt.datetime | None
+    updated_at: dt.datetime
+    # Computed server-side: a wrong client clock shouldn't decide whether scores look stale.
+    # Defaulted so it can be validated from the ORM row, then filled in by the route.
+    sync_is_stale: bool = False
 
 
 class ProfileIn(BaseModel):
