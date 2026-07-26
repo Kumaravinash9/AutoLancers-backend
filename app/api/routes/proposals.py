@@ -107,10 +107,18 @@ async def stats(session: AsyncSession = Depends(get_session)) -> ProposalStats:
         return await session.scalar(select(func.count(Proposal.id)).where(mine, *where)) or 0
 
     async def avg_score(*where) -> float | None:
+        # Join through the project, not through recommendation_id. An imported bid deliberately
+        # has no recommendation_id — we didn't recommend it — but the sync still scores its
+        # project, and that score is exactly what calibration needs. Joining on the FK would
+        # silently restrict the average to bids we suggested, which is the flattering half.
         value = await session.scalar(
             select(func.avg(Recommendation.score))
             .select_from(Proposal)
-            .join(Recommendation, Recommendation.id == Proposal.recommendation_id)
+            .join(
+                Recommendation,
+                (Recommendation.project_id == Proposal.project_id)
+                & (Recommendation.freelancer_id == Proposal.freelancer_id),
+            )
             .where(mine, *where)
         )
         return round(float(value), 1) if value is not None else None
