@@ -13,17 +13,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.api.schemas import ProposalOut, ProposalStats
-from app.db.models import Project, Proposal, ProposalStatus, Recommendation
+from app.db.models import (
+    FreelancerProfile,
+    Project,
+    Proposal,
+    ProposalStatus,
+    Recommendation,
+    User,
+)
 from app.db.session import get_session
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
 router = APIRouter(prefix="/proposals", tags=["proposals"])
 
 
-def _out(proposal: Proposal, project: Project, rec: Recommendation | None) -> ProposalOut:
+def _out(
+    proposal: Proposal,
+    project: Project,
+    rec: Recommendation | None,
+    user: User,
+    profile: FreelancerProfile,
+) -> ProposalOut:
     return ProposalOut(
         id=proposal.id,
         recommendation_id=proposal.recommendation_id,
+        user_id=user.id,
+        user_email=user.email,
+        freelancer_name=profile.display_name or user.name or user.email,
+        was_recommended=proposal.recommendation_id is not None,
         project_title=project.title,
         project_url=project.project_url,
         platform=project.platform,
@@ -74,7 +91,7 @@ async def list_proposals(
     ).limit(limit)
 
     rows = (await session.execute(query)).unique().all()
-    return [_out(p, proj, rec) for p, proj, rec in rows]
+    return [_out(p, proj, rec, user, profile) for p, proj, rec in rows]
 
 
 @router.get("/stats", response_model=ProposalStats)
@@ -102,6 +119,8 @@ async def stats(session: AsyncSession = Depends(get_session)) -> ProposalStats:
     )
 
     return ProposalStats(
+        from_recommendation=await count(Proposal.recommendation_id.is_not(None)),
+        self_directed=await count(Proposal.recommendation_id.is_(None)),
         total=await count(),
         drafted=await count(Proposal.status == ProposalStatus.DRAFT),
         submitted=await count(Proposal.status == ProposalStatus.SUBMITTED),

@@ -206,6 +206,18 @@ class ProposalOut(BaseModel):
 
     id: uuid.UUID
     recommendation_id: uuid.UUID | None
+
+    # Who placed it. Two people on the same platform can bid the same project, so a proposal is
+    # only meaningful attached to a freelancer.
+    user_id: uuid.UUID
+    user_email: str
+    freelancer_name: str
+
+    # Whether this came from our recommendation or was bid independently. Without the
+    # distinction, our score would appear to "cover" bids it never influenced, which would
+    # flatter the calibration numbers below.
+    was_recommended: bool
+
     project_title: str
     project_url: str
     platform: str
@@ -242,3 +254,7 @@ class ProposalStats(BaseModel):
     avg_score_submitted: float | None
     avg_score_accepted: float | None
     total_output_tokens: int
+
+    # Split by origin, so the score is judged only on the bids it actually drove.
+    from_recommendation: int
+    self_directed: int
