@@ -7,6 +7,8 @@ you can actually calibrate.
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,6 +71,10 @@ async def list_proposals(
     status: str | None = Query(
         default=None, pattern="^(DRAFT|SUBMITTED|ACCEPTED|REJECTED|WITHDRAWN)$"
     ),
+    connection_id: uuid.UUID | None = Query(
+        default=None,
+        description="Scope to one marketplace account. Omit for all of them.",
+    ),
     limit: int = Query(default=100, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> list[ProposalOut]:
@@ -84,6 +90,8 @@ async def list_proposals(
     )
     if status is not None:
         query = query.where(Proposal.status == status)
+    if connection_id is not None:
+        query = query.where(Proposal.connection_id == connection_id)
 
     # Newest activity first: a submitted bid is sorted by when it went out, a draft by when it
     # was written.
@@ -96,15 +104,26 @@ async def list_proposals(
 
 
 @router.get("/stats", response_model=ProposalStats)
-async def stats(session: AsyncSession = Depends(get_session)) -> ProposalStats:
+async def stats(
+    connection_id: uuid.UUID | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+) -> ProposalStats:
     """Does a higher score actually convert? This is where you find out."""
     user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
     mine = Proposal.freelancer_id == profile.id
+    # Scoping to one account changes what every figure below means, so it is applied to the
+    # base predicate rather than to each query in turn.
+    scope = (Proposal.connection_id == connection_id,) if connection_id else ()
 
     async def count(*where) -> int:
-        return await session.scalar(select(func.count(Proposal.id)).where(mine, *where)) or 0
+        return (
+            await session.scalar(
+                select(func.count(Proposal.id)).where(mine, *scope, *where)
+            )
+            or 0
+        )
 
     async def avg_score(*where) -> float | None:
         # Join through the project, not through recommendation_id. An imported bid deliberately
@@ -119,12 +138,12 @@ async def stats(session: AsyncSession = Depends(get_session)) -> ProposalStats:
                 (Recommendation.project_id == Proposal.project_id)
                 & (Recommendation.freelancer_id == Proposal.freelancer_id),
             )
-            .where(mine, *where)
+            .where(mine, *scope, *where)
         )
         return round(float(value), 1) if value is not None else None
 
     tokens = await session.scalar(
-        select(func.coalesce(func.sum(Proposal.output_tokens), 0)).where(mine)
+        select(func.coalesce(func.sum(Proposal.output_tokens), 0)).where(mine, *scope)
     )
 
     return ProposalStats(
