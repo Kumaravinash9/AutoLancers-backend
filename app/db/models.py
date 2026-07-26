@@ -182,6 +182,21 @@ class PlatformConnection(Base):
     # the same person can present differently on Freelancer and Upwork.
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # The account's own public profile, as the marketplace holds it — distinct from the
+    # ``freelancer_profiles`` row, which is our scoring configuration. Two Freelancer accounts run
+    # by the same person advertise different skills and rates, and that is what a client sees.
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tagline: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    account_skills: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    hourly_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    portfolio_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    member_since: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     connected_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     token_expires_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

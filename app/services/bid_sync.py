@@ -13,6 +13,7 @@ A bid whose project we have never seen is fetched and stored, so it can be score
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import uuid
 from dataclasses import dataclass
@@ -332,10 +333,13 @@ def _as_datetime(value: Any):
 async def _store_identity(
     session: AsyncSession, connection: PlatformConnection, me: dict[str, Any]
 ) -> None:
-    """Save the marketplace's own picture, handle and rating onto the connection.
+    """Save the marketplace's own view of this account: picture, handle, rating and public profile.
 
     Freelancer serves several avatar sizes; prefer the large CDN one, since an image scaled down
     looks better than one scaled up.
+
+    Every field here is overwritten from the marketplace on each sync, deliberately — this is a
+    mirror of what clients see there, not something editable on our side.
     """
     avatar = (
         me.get("avatar_large_cdn")
@@ -356,4 +360,27 @@ async def _store_identity(
     if reputation.get("reviews") is not None:
         connection.total_reviews = int(reputation["reviews"])
 
+    connection.display_name = me.get("public_name") or me.get("display_name")
+    connection.tagline = me.get("tagline")
+    connection.summary = me.get("profile_description")
+    connection.account_skills = [
+        job["name"] for job in (me.get("jobs") or []) if isinstance(job, dict) and job.get("name")
+    ]
+    connection.hourly_rate = _as_float(me.get("hourly_rate"))
+    connection.currency = (me.get("primary_currency") or {}).get("code")
+    connection.country = ((me.get("location") or {}).get("country") or {}).get("name")
+    connection.portfolio_count = _as_int(me.get("portfolio_count"))
+
+    registered = me.get("registration_date")
+    if isinstance(registered, int | float):
+        connection.member_since = dt.datetime.fromtimestamp(registered, tz=dt.UTC)
+
     connection.last_synced_at = utcnow()
+
+
+def _as_float(value: Any) -> float | None:
+    return float(value) if isinstance(value, int | float) else None
+
+
+def _as_int(value: Any) -> int | None:
+    return int(value) if isinstance(value, int | float) else None

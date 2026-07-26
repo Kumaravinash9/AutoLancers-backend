@@ -120,6 +120,39 @@ async def _card(
     }
 
 
+def _connection_out(c: PlatformConnection, proposals: int = 0, wins: int = 0) -> ConnectionOut:
+    """One connection as the API returns it.
+
+    Built in one place because both the profile detail and the connections list serve the same
+    shape, and a field added to one but not the other shows up as a silently empty card.
+    """
+    return ConnectionOut(
+        id=c.id,
+        proposals=proposals,
+        wins=wins,
+        platform=c.platform,
+        platform_username=c.platform_username,
+        scope=c.scope,
+        rating=c.rating,
+        total_reviews=c.total_reviews,
+        # Freelancer serves a grey placeholder for accounts with no picture; treat it as no
+        # picture so the UI can fall back to initials instead.
+        avatar_url=None if (c.avatar_url or "").endswith("unknown.png") else c.avatar_url,
+        status=c.status,
+        display_name=c.display_name,
+        tagline=c.tagline,
+        summary=c.summary,
+        account_skills=c.account_skills or [],
+        hourly_rate=c.hourly_rate,
+        currency=c.currency,
+        country=c.country,
+        portfolio_count=c.portfolio_count,
+        member_since=c.member_since,
+        connected_at=c.connected_at,
+        last_synced_at=c.last_synced_at,
+    )
+
+
 @router.get("/profiles", response_model=list[ProfileCard])
 async def list_profiles(session: AsyncSession = Depends(get_session)) -> list[ProfileCard]:
     """Every profile on this account.
@@ -175,18 +208,7 @@ async def get_profile(
         weight_recency=profile.weight_recency,
         proposal_notes=profile.proposal_notes,
         connections=[
-            ConnectionOut(
-                id=c.id,
-                platform=c.platform,
-                platform_username=c.platform_username,
-                scope=c.scope,
-                rating=c.rating,
-                total_reviews=c.total_reviews,
-                avatar_url=c.avatar_url,
-                status=c.status,
-                connected_at=c.connected_at,
-                last_synced_at=c.last_synced_at,
-            )
+            _connection_out(c)
             for c in connections
         ],
         avg_score=round(float(avg), 1) if avg is not None else None,
@@ -308,22 +330,7 @@ async def list_connections(session: AsyncSession = Depends(get_session)) -> list
             or 0
         )
         out.append(
-            ConnectionOut(
-                id=c.id,
-                proposals=placed,
-                wins=won,
-                platform=c.platform,
-                platform_username=c.platform_username,
-                scope=c.scope,
-                rating=c.rating,
-                total_reviews=c.total_reviews,
-                # Freelancer serves a grey placeholder for accounts with no picture; treat it as
-                # no picture so the UI can fall back to initials instead.
-                avatar_url=None if (c.avatar_url or "").endswith("unknown.png") else c.avatar_url,
-                status=c.status,
-                connected_at=c.connected_at,
-                last_synced_at=c.last_synced_at,
-            )
+            _connection_out(c, proposals=placed, wins=won)
         )
     return out
 

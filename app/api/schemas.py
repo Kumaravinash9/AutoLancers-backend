@@ -283,6 +283,16 @@ class ConnectionOut(BaseModel):
     total_reviews: int | None
     avatar_url: str | None
     status: str
+    # The account's public profile on the marketplace, mirrored on each sync.
+    display_name: str | None = None
+    tagline: str | None = None
+    summary: str | None = None
+    account_skills: list[str] = []
+    hourly_rate: float | None = None
+    currency: str | None = None
+    country: str | None = None
+    portfolio_count: int | None = None
+    member_since: dt.datetime | None = None
     connected_at: dt.datetime | None
     last_synced_at: dt.datetime | None
 

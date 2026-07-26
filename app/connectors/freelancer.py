@@ -75,14 +75,23 @@ class FreelancerClient:
         return {AUTH_HEADER: self.access_token} if self.access_token else {}
 
     async def fetch_self(self) -> dict[str, Any]:
-        """The authenticated user's own record: id, username, avatar and reputation.
+        """The authenticated user's own record: identity, reputation and public profile.
 
-        ``avatar=true`` and ``reputation=true`` are opt-in flags; without them the response omits
-        those blocks entirely rather than returning nulls.
+        Every one of these is an opt-in flag; without them the response omits the block entirely
+        rather than returning nulls. ``jobs`` carries the skills the account advertises and
+        ``profile_description`` the summary — the two things a client actually reads.
         """
         payload = await self._get(
             f"{API_BASE}{SELF_PATH}",
-            {"avatar": "true", "reputation": "true", "display_info": "true"},
+            {
+                "avatar": "true",
+                "reputation": "true",
+                "display_info": "true",
+                "jobs": "true",
+                "profile_description": "true",
+                "country_details": "true",
+                "portfolio_details": "true",
+            },
         )
         return (payload.get("result") or {}) or {}
 
