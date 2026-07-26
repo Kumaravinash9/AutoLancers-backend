@@ -137,16 +137,42 @@ async def _post_token(payload: dict[str, str]) -> TokenResponse:
 async def store_token(
     session: AsyncSession, user_id: uuid.UUID, token: TokenResponse, platform: str = "freelancer"
 ) -> PlatformConnection:
-    """Upsert the encrypted token for this user+platform."""
+    """Upsert the encrypted token for this specific marketplace account.
+
+    Asks the marketplace who the token belongs to before storing it. Without that, connecting a
+    second Freelancer account would overwrite the first — the two are indistinguishable until you
+    ask.
+    """
+    from app.connectors.freelancer import FreelancerAPIError, FreelancerClient
+
+    account_id: str | None = None
+    username: str | None = None
+    try:
+        me = await FreelancerClient(access_token=token.access_token).fetch_self()
+        account_id = str(me.get("id") or "") or None
+        username = me.get("username")
+    except FreelancerAPIError:
+        # A token we can't identify is still worth storing; it just can't be told apart yet.
+        pass
+
     existing = await session.scalar(
         select(PlatformConnection).where(
-            PlatformConnection.user_id == user_id, PlatformConnection.platform == platform
+            PlatformConnection.user_id == user_id,
+            PlatformConnection.platform == platform,
+            PlatformConnection.platform_user_id == account_id,
         )
     )
 
     if existing is None:
-        existing = PlatformConnection(user_id=user_id, platform=platform)
+        existing = PlatformConnection(
+            user_id=user_id,
+            platform=platform,
+            platform_user_id=account_id,
+            platform_username=username,
+        )
         session.add(existing)
+    elif username:
+        existing.platform_username = username
 
     existing.access_token_encrypted = encrypt(token.access_token)
     # A refresh response may omit the refresh token; keep the one we already hold.
@@ -161,13 +187,24 @@ async def store_token(
 
 
 async def get_valid_access_token(
-    session: AsyncSession, user_id: uuid.UUID, platform: str = "freelancer"
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    platform: str = "freelancer",
+    connection: PlatformConnection | None = None,
 ) -> str:
-    """Return a usable access token, refreshing first if it is at or near expiry."""
-    row = await session.scalar(
-        select(PlatformConnection).where(
-            PlatformConnection.user_id == user_id, PlatformConnection.platform == platform
+    """Return a usable access token, refreshing first if it is at or near expiry.
+
+    With several accounts connected, pass the one you mean. Omitting it picks the oldest active
+    connection, which keeps single-account installs working unchanged.
+    """
+    row = connection or await session.scalar(
+        select(PlatformConnection)
+        .where(
+            PlatformConnection.user_id == user_id,
+            PlatformConnection.platform == platform,
+            PlatformConnection.status == "ACTIVE",
         )
+        .order_by(PlatformConnection.connected_at)
     )
     if row is None:
         raise OAuthError(

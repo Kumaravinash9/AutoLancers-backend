@@ -176,6 +176,7 @@ async def get_profile(
         proposal_notes=profile.proposal_notes,
         connections=[
             ConnectionOut(
+                id=c.id,
                 platform=c.platform,
                 platform_username=c.platform_username,
                 scope=c.scope,
@@ -276,3 +277,54 @@ async def sync_everything(
         last_synced_at=profile.last_synced_at,
         bids_synced_at=profile.bids_synced_at,
     )
+
+
+@router.get("/connections", response_model=list[ConnectionOut])
+async def list_connections(session: AsyncSession = Depends(get_session)) -> list[ConnectionOut]:
+    """Every marketplace account linked to this user."""
+    user = await get_or_create_default_user(session)
+    rows = (
+        await session.scalars(
+            select(PlatformConnection)
+            .where(PlatformConnection.user_id == user.id)
+            .order_by(PlatformConnection.connected_at)
+        )
+    ).all()
+    return [
+        ConnectionOut(
+            id=c.id,
+            platform=c.platform,
+            platform_username=c.platform_username,
+            scope=c.scope,
+            rating=c.rating,
+            total_reviews=c.total_reviews,
+            avatar_url=c.avatar_url,
+            status=c.status,
+            connected_at=c.connected_at,
+            last_synced_at=c.last_synced_at,
+        )
+        for c in rows
+    ]
+
+
+@router.delete("/connections/{connection_id}", status_code=204)
+async def remove_connection(
+    connection_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+) -> None:
+    """Disconnect a marketplace account.
+
+    Deletes the stored credential only. Projects, recommendations and proposals already gathered
+    through it stay — they are your record of work, not the platform's, and losing your bid
+    history because you rotated an account would be its own bug.
+    """
+    user = await get_or_create_default_user(session)
+    connection = await session.scalar(
+        select(PlatformConnection).where(
+            PlatformConnection.id == connection_id, PlatformConnection.user_id == user.id
+        )
+    )
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    await session.delete(connection)
+    await session.commit()

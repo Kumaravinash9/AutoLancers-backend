@@ -157,7 +157,13 @@ class PlatformConnection(Base):
     """
 
     __tablename__ = "platform_connections"
-    __table_args__ = (UniqueConstraint("user_id", "platform", name="uq_connection_user_platform"),)
+    # Keyed by the marketplace account, not just the platform: one person can operate several
+    # Freelancer accounts, and a per-platform constraint would silently overwrite one with the next.
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "platform", "platform_user_id", name="uq_connection_user_platform_account"
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _pk()
     user_id: Mapped[uuid.UUID] = _fk("users.id", index=True)

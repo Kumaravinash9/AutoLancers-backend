@@ -71,8 +71,39 @@ async def sync_bids(
 ) -> SyncReport:
     report = SyncReport()
 
+    connections = (
+        await session.scalars(
+            select(PlatformConnection).where(
+                PlatformConnection.user_id == user_id,
+                PlatformConnection.platform == "freelancer",
+                PlatformConnection.status == "ACTIVE",
+            )
+        )
+    ).all()
+    if not connections:
+        report.error = "No freelancer account connected."
+        return report
+
+    # Every connected account contributes its own bids. Syncing only the first would silently
+    # under-report someone operating two.
+    for connection in connections:
+        await _sync_one(session, user_id, profile, connection, report)
+
+    profile.bids_synced_at = utcnow()
+    await session.commit()
+    logger.info("Bid sync: %s", report.as_dict())
+    return report
+
+
+async def _sync_one(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    profile: FreelancerProfile,
+    connection: PlatformConnection,
+    report: SyncReport,
+) -> SyncReport:
     try:
-        token = await get_valid_access_token(session, user_id)
+        token = await get_valid_access_token(session, user_id, connection=connection)
     except OAuthError as exc:
         report.error = str(exc)
         return report
@@ -84,17 +115,15 @@ async def sync_bids(
         bidder_id = int(me.get("id") or 0)
         if not bidder_id:
             raise FreelancerAPIError("Could not read own user id")
-        await _store_identity(session, user_id, me)
+        await _store_identity(session, connection, me)
         bids = await client.fetch_my_bids(bidder_id)
     except FreelancerAPIError as exc:
         report.error = str(exc)
         logger.warning("Bid sync failed: %s", exc)
         return report
 
-    report.fetched = len(bids)
+    report.fetched += len(bids)
     if not bids:
-        profile.bids_synced_at = utcnow()
-        await session.commit()
         return report
 
     # Resolve every project referenced by a bid in one pass, then fetch only the unknown ones.
@@ -136,9 +165,6 @@ async def sync_bids(
         report.imported += int(outcome.imported)
         report.outcomes_updated += int(outcome.outcome_changed)
 
-    profile.bids_synced_at = utcnow()
-    await session.commit()
-    logger.info("Bid sync: %s", report.as_dict())
     return report
 
 
@@ -302,21 +328,13 @@ def _as_datetime(value: Any):
 
 
 async def _store_identity(
-    session: AsyncSession, user_id: uuid.UUID, me: dict[str, Any]
+    session: AsyncSession, connection: PlatformConnection, me: dict[str, Any]
 ) -> None:
     """Save the marketplace's own picture, handle and rating onto the connection.
 
     Freelancer serves several avatar sizes; prefer the large CDN one, since an image scaled down
     looks better than one scaled up.
     """
-    connection = await session.scalar(
-        select(PlatformConnection).where(
-            PlatformConnection.user_id == user_id, PlatformConnection.platform == "freelancer"
-        )
-    )
-    if connection is None:
-        return
-
     avatar = (
         me.get("avatar_large_cdn")
         or me.get("avatar_cdn")

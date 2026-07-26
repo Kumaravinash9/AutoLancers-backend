@@ -267,8 +267,9 @@ class ProposalStats(BaseModel):
 
 
 class ConnectionOut(BaseModel):
-    """A marketplace this profile is linked to."""
+    """One marketplace account linked to this user."""
 
+    id: uuid.UUID
     platform: str
     platform_username: str | None
     scope: str | None
