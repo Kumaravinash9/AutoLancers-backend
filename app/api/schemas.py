@@ -1,17 +1,25 @@
+"""Wire shapes.
+
+``JobOut`` deliberately keeps the flat shape the frontend already consumes, even though the data
+now comes from three tables. Splitting projects from recommendations was a storage decision; it
+shouldn't force every client to relearn the API.
+"""
+
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class JobOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    """A recommendation, flattened with its project and proposal."""
 
-    id: int
+    id: uuid.UUID
     platform: str
-    external_id: str
+    external_id: str | None
     title: str
     description: str
     url: str
@@ -33,13 +41,15 @@ class JobOut(BaseModel):
     bid_period_days: int | None
     bid_submitted_at: dt.datetime | None
     external_bid_id: str | None
+    has_changes: bool
+    changed_at: dt.datetime | None
 
 
 class JobPatch(BaseModel):
     proposal_text: str | None = None
-    # "submitted" is intentionally not settable here — it is only ever reached by actually
-    # placing a bid, so the status can't drift away from what happened on Freelancer.
-    status: str | None = Field(default=None, pattern="^(new|drafted|approved|dismissed)$")
+    # "submitted" isn't settable here — it's only reached by actually placing a bid, so the
+    # status can't drift away from what happened on Freelancer.
+    status: str | None = Field(default=None, pattern="^(NEW|VIEWED|APPLIED|DISMISSED)$")
 
 
 class BidRequest(BaseModel):
@@ -75,7 +85,7 @@ class ProfileOut(BaseModel):
     keywords_include: list[str]
     keywords_exclude: list[str]
     fixed_project_min: float
-    hourly_min: float
+    rate_min: float
     currency: str
     max_existing_bids: int
     min_match_score: float
@@ -93,7 +103,7 @@ class ProfileIn(BaseModel):
     keywords_include: list[str] = Field(default_factory=list)
     keywords_exclude: list[str] = Field(default_factory=list)
     fixed_project_min: float = 0.0
-    hourly_min: float = 0.0
+    rate_min: float = 0.0
     currency: str = "USD"
     max_existing_bids: int = 25
     min_match_score: float = 55.0
@@ -120,7 +130,7 @@ class Credentials(BaseModel):
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: uuid.UUID
     email: str
     role: str
     is_active: bool
@@ -133,7 +143,7 @@ class RoleUpdate(BaseModel):
 
 
 class AdminUserOut(BaseModel):
-    id: int
+    id: uuid.UUID
     email: str
     role: str
     is_active: bool
@@ -147,8 +157,7 @@ class AdminUserOut(BaseModel):
 class CycleRunOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    user_id: int
+    id: uuid.UUID
     started_at: dt.datetime
     duration_ms: int
     fetched: int

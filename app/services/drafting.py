@@ -23,7 +23,7 @@ import httpx
 
 from app.config import get_settings
 from app.connectors.freelancer import JobPosting
-from app.db.models import Profile
+from app.db.models import FreelancerProfile
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def _system_prompt() -> str:
     return _PROMPT_PATH.read_text(encoding="utf-8")
 
 
-async def draft_proposal(job: JobPosting, profile: Profile) -> Draft:
+async def draft_proposal(job: JobPosting, profile: FreelancerProfile) -> Draft:
     """Draft one proposal. Raises ``DraftingError``; callers are expected to catch and continue."""
     settings = get_settings()
     message = _build_user_message(job, profile)
@@ -175,7 +175,7 @@ async def _draft_with_anthropic(message: str) -> Draft:
     )
 
 
-def _build_user_message(job: JobPosting, profile: Profile) -> str:
+def _build_user_message(job: JobPosting, profile: FreelancerProfile) -> str:
     description = job.description[:DESCRIPTION_LIMIT]
     if len(job.description) > DESCRIPTION_LIMIT:
         description += "\n[description truncated]"
@@ -200,7 +200,7 @@ def _build_user_message(job: JobPosting, profile: Profile) -> str:
     )
 
 
-def _profile_block(profile: Profile) -> str:
+def _profile_block(profile: FreelancerProfile) -> str:
     skills = ", ".join(s["name"] for s in (profile.skills or []) if s.get("name"))
     lines = [
         f"Name / brand: {profile.display_name or 'not set'}",

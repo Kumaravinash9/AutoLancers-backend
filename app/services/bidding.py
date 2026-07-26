@@ -7,8 +7,8 @@ Four independent gates have to be open before a bid leaves the machine:
 
 1. ``ENABLE_BIDDING`` is on in config
 2. the caller passed ``confirm=True``
-3. the stored token actually carries the bid scope
-4. this job has not already been bid on
+3. the stored connection actually carries the bid scope
+4. this recommendation has not already been bid on
 
 Any one of them closed means no request is made. They are separate on purpose: a config flag
 alone should not be able to turn a review tool into an auto-bidder.
@@ -17,6 +17,7 @@ alone should not be able to turn a review tool into an auto-bidder.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -25,7 +26,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.freelancer_oauth import OAuthError, get_valid_access_token, has_bid_scope
 from app.config import get_settings
 from app.connectors.freelancer import FreelancerAPIError, FreelancerClient
-from app.db.models import Job, OAuthToken, utcnow
+from app.db.models import (
+    PlatformConnection,
+    ProposalStatus,
+    Recommendation,
+    RecommendationStatus,
+    SubmittedVia,
+    utcnow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +53,14 @@ class BidAvailability:
     reason: str
 
 
-def check_availability(token_row: OAuthToken | None) -> BidAvailability:
+def check_availability(connection: PlatformConnection | None) -> BidAvailability:
     settings = get_settings()
 
     if not settings.enable_bidding:
         return BidAvailability(False, "Bidding is switched off in this install (ENABLE_BIDDING).")
-    if token_row is None:
+    if connection is None:
         return BidAvailability(False, "Connect your Freelancer account first.")
-    if not has_bid_scope(token_row.scope):
+    if not has_bid_scope(connection.scope):
         return BidAvailability(
             False,
             "Your connection is read-only. Freelancer must approve the bid permission for this "
@@ -61,10 +69,10 @@ def check_availability(token_row: OAuthToken | None) -> BidAvailability:
     return BidAvailability(True, "Ready to submit.")
 
 
-async def submit_bid_for_job(
+async def submit_bid_for_recommendation(
     session: AsyncSession,
-    user_id: int,
-    job: Job,
+    user_id: uuid.UUID,
+    recommendation: Recommendation,
     amount: float,
     period_days: int,
     confirm: bool,
@@ -77,12 +85,16 @@ async def submit_bid_for_job(
         raise BiddingError("Bidding is switched off in this install (ENABLE_BIDDING).")
     if not confirm:
         raise BiddingError("Bid not confirmed — nothing was submitted.")
-    if job.external_bid_id:
-        raise BiddingError(f"Already bid on this project (bid {job.external_bid_id}).")
-    if job.rejected:
+
+    proposal = recommendation.proposal
+    if proposal is not None and proposal.external_bid_id:
+        raise BiddingError(f"Already bid on this project (bid {proposal.external_bid_id}).")
+    if recommendation.is_hard_rejected:
         raise BiddingError("This job was filtered out. Re-score or adjust your profile first.")
 
-    description = (job.proposal_text or "").strip()
+    # Parenthesised deliberately: without them the `or ""` binds to the else branch only, so a
+    # proposal row holding NULL text slips through and blows up on .strip().
+    description = ((proposal.proposal_text if proposal else None) or "").strip()
     if len(description) < MIN_DESCRIPTION_CHARS:
         raise BiddingError("Write or generate a proposal before bidding.")
     if amount <= 0:
@@ -93,12 +105,12 @@ async def submit_bid_for_job(
     # The scope gate belongs here, not only in the availability endpoint the UI reads. Enforcing
     # it in the read path alone meant a direct API call reached Freelancer holding a read-only
     # token — and a remote rejection is not a substitute for our own guarantee.
-    token_row = await session.scalar(
-        select(OAuthToken).where(
-            OAuthToken.user_id == user_id, OAuthToken.platform == "freelancer"
+    connection = await session.scalar(
+        select(PlatformConnection).where(
+            PlatformConnection.user_id == user_id, PlatformConnection.platform == "freelancer"
         )
     )
-    availability = check_availability(token_row)
+    availability = check_availability(connection)
     if not availability.available:
         raise BiddingError(availability.reason)
 
@@ -112,22 +124,29 @@ async def submit_bid_for_job(
     try:
         bidder_id = await client.fetch_self_id()
         bid_id = await client.submit_bid(
-            project_id=int(job.external_id),
+            project_id=int(recommendation.project.external_id),
             bidder_id=bidder_id,
             amount=amount,
             period_days=period_days,
             description=description,
             milestone_percentage=milestone_percentage,
         )
-    except (FreelancerAPIError, ValueError) as exc:
+    except (FreelancerAPIError, ValueError, TypeError) as exc:
         raise BiddingError(str(exc)) from exc
 
-    job.external_bid_id = bid_id
-    job.bid_amount = amount
-    job.bid_period_days = period_days
-    job.bid_submitted_at = utcnow()
-    job.status = "submitted"
+    proposal.external_bid_id = bid_id
+    proposal.bid_amount = amount
+    proposal.estimated_days = period_days
+    proposal.submitted_at = utcnow()
+    proposal.submitted_via = SubmittedVia.API
+    proposal.status = ProposalStatus.SUBMITTED
+    recommendation.status = RecommendationStatus.APPLIED
     await session.commit()
 
-    logger.info("Bid %s placed on project %s for %.2f", bid_id, job.external_id, amount)
+    logger.info(
+        "Bid %s placed on project %s for %.2f",
+        bid_id,
+        recommendation.project.external_id,
+        amount,
+    )
     return bid_id

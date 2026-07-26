@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import secrets
+import uuid
 from dataclasses import dataclass
 
 import httpx
@@ -22,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.crypto import decrypt, encrypt
 from app.config import get_settings
-from app.db.models import OAuthToken, utcnow
+from app.db.models import PlatformConnection, utcnow
 
 AUTHORIZE_URL = "https://accounts.freelancer.com/oauth/authorise"
 TOKEN_URL = "https://accounts.freelancer.com/oauth/token"
@@ -134,24 +135,24 @@ async def _post_token(payload: dict[str, str]) -> TokenResponse:
 
 
 async def store_token(
-    session: AsyncSession, user_id: int, token: TokenResponse, platform: str = "freelancer"
-) -> OAuthToken:
+    session: AsyncSession, user_id: uuid.UUID, token: TokenResponse, platform: str = "freelancer"
+) -> PlatformConnection:
     """Upsert the encrypted token for this user+platform."""
     existing = await session.scalar(
-        select(OAuthToken).where(
-            OAuthToken.user_id == user_id, OAuthToken.platform == platform
+        select(PlatformConnection).where(
+            PlatformConnection.user_id == user_id, PlatformConnection.platform == platform
         )
     )
 
     if existing is None:
-        existing = OAuthToken(user_id=user_id, platform=platform)
+        existing = PlatformConnection(user_id=user_id, platform=platform)
         session.add(existing)
 
-    existing.access_token = encrypt(token.access_token)
+    existing.access_token_encrypted = encrypt(token.access_token)
     # A refresh response may omit the refresh token; keep the one we already hold.
     if token.refresh_token:
-        existing.refresh_token = encrypt(token.refresh_token)
-    existing.expires_at = token.expires_at
+        existing.refresh_token_encrypted = encrypt(token.refresh_token)
+    existing.token_expires_at = token.expires_at
     existing.scope = token.scope
 
     await session.commit()
@@ -160,12 +161,12 @@ async def store_token(
 
 
 async def get_valid_access_token(
-    session: AsyncSession, user_id: int, platform: str = "freelancer"
+    session: AsyncSession, user_id: uuid.UUID, platform: str = "freelancer"
 ) -> str:
     """Return a usable access token, refreshing first if it is at or near expiry."""
     row = await session.scalar(
-        select(OAuthToken).where(
-            OAuthToken.user_id == user_id, OAuthToken.platform == platform
+        select(PlatformConnection).where(
+            PlatformConnection.user_id == user_id, PlatformConnection.platform == platform
         )
     )
     if row is None:
@@ -174,21 +175,21 @@ async def get_valid_access_token(
         )
 
     if _needs_refresh(row):
-        if not row.refresh_token:
+        if not row.refresh_token_encrypted:
             raise OAuthError(
                 f"{platform} token expired and no refresh token is stored. Re-authorize with: "
                 "uv run python scripts/oauth_login.py"
             )
-        refreshed = await refresh_access_token(decrypt(row.refresh_token))
+        refreshed = await refresh_access_token(decrypt(row.refresh_token_encrypted))
         row = await store_token(session, user_id, refreshed, platform)
 
-    return decrypt(row.access_token)
+    return decrypt(row.access_token_encrypted)
 
 
-def _needs_refresh(row: OAuthToken) -> bool:
-    if row.expires_at is None:
+def _needs_refresh(row: PlatformConnection) -> bool:
+    if row.token_expires_at is None:
         return False
-    expires_at = row.expires_at
+    expires_at = row.token_expires_at
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=dt.UTC)
     return expires_at - _REFRESH_MARGIN <= utcnow()

@@ -7,13 +7,13 @@ import datetime as dt
 import pytest
 
 from app.connectors.freelancer import JobPosting, normalize_project
-from app.db.models import Profile
+from app.db.models import FreelancerProfile
 from app.services.scoring import score_job
 
 NOW = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.UTC)
 
 
-def make_profile(**overrides) -> Profile:
+def make_profile(**overrides) -> FreelancerProfile:
     defaults = dict(
         display_name="InnoAI Labs",
         headline="AI systems, backends and client-owned websites",
@@ -26,7 +26,7 @@ def make_profile(**overrides) -> Profile:
         keywords_include=[],
         keywords_exclude=["equity only", "unpaid"],
         fixed_project_min=500.0,
-        hourly_min=25.0,
+        rate_min=25.0,
         currency="USD",
         max_existing_bids=25,
         min_match_score=55.0,
@@ -37,7 +37,7 @@ def make_profile(**overrides) -> Profile:
         proposal_notes="",
     )
     defaults.update(overrides)
-    return Profile(**defaults)
+    return FreelancerProfile(**defaults)
 
 
 def make_job(**overrides) -> JobPosting:

@@ -7,6 +7,7 @@ frontend hiding the link is presentation, and presentation is not security.
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -14,7 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import AdminOverview, AdminUserOut, CycleRunOut, RoleUpdate, UserOut
 from app.auth.accounts import require_admin
-from app.db.models import CycleRun, Job, OAuthToken, Role, User, utcnow
+from app.db.models import (
+    CycleRun,
+    FreelancerProfile,
+    PlatformConnection,
+    Proposal,
+    Recommendation,
+    Role,
+    User,
+    utcnow,
+)
 from app.db.session import get_session
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
@@ -29,23 +39,33 @@ async def overview(session: AsyncSession = Depends(get_session)) -> AdminOvervie
     active_users = (
         await session.scalar(select(func.count(User.id)).where(User.is_active.is_(True))) or 0
     )
-    connected = await session.scalar(select(func.count(OAuthToken.id))) or 0
+    connected = await session.scalar(select(func.count(PlatformConnection.id))) or 0
 
-    total_jobs = await session.scalar(select(func.count(Job.id))) or 0
+    total_jobs = await session.scalar(select(func.count(Recommendation.id))) or 0
     matched = (
-        await session.scalar(select(func.count(Job.id)).where(Job.rejected.is_(False))) or 0
+        await session.scalar(
+            select(func.count(Recommendation.id)).where(
+                Recommendation.is_hard_rejected.is_(False)
+            )
+        )
+        or 0
     )
     drafted = (
-        await session.scalar(select(func.count(Job.id)).where(Job.proposal_text.isnot(None))) or 0
+        await session.scalar(
+            select(func.count(Proposal.id)).where(Proposal.proposal_text.isnot(None))
+        )
+        or 0
     )
     bids = (
-        await session.scalar(select(func.count(Job.id)).where(Job.external_bid_id.isnot(None)))
+        await session.scalar(
+            select(func.count(Proposal.id)).where(Proposal.external_bid_id.isnot(None))
+        )
         or 0
     )
 
-    tokens_in = await session.scalar(select(func.coalesce(func.sum(Job.proposal_input_tokens), 0)))
+    tokens_in = await session.scalar(select(func.coalesce(func.sum(Proposal.input_tokens), 0)))
     tokens_out = await session.scalar(
-        select(func.coalesce(func.sum(Job.proposal_output_tokens), 0))
+        select(func.coalesce(func.sum(Proposal.output_tokens), 0))
     )
 
     cycles_24h = (
@@ -105,11 +125,17 @@ async def users(session: AsyncSession = Depends(get_session)) -> list[AdminUserO
 
     out: list[AdminUserOut] = []
     for user in rows:
+        # Recommendations belong to a profile, which belongs to a user.
         job_count = (
-            await session.scalar(select(func.count(Job.id)).where(Job.user_id == user.id)) or 0
+            await session.scalar(
+                select(func.count(Recommendation.id))
+                .join(FreelancerProfile, FreelancerProfile.id == Recommendation.freelancer_id)
+                .where(FreelancerProfile.user_id == user.id)
+            )
+            or 0
         )
         token = await session.scalar(
-            select(OAuthToken).where(OAuthToken.user_id == user.id)
+            select(PlatformConnection).where(PlatformConnection.user_id == user.id)
         )
         out.append(
             AdminUserOut(
@@ -129,7 +155,7 @@ async def users(session: AsyncSession = Depends(get_session)) -> list[AdminUserO
 
 @router.patch("/users/{user_id}/role", response_model=UserOut)
 async def set_role(
-    user_id: int,
+    user_id: uuid.UUID,
     body: RoleUpdate,
     session: AsyncSession = Depends(get_session),
     admin: User = Depends(require_admin),
@@ -153,7 +179,7 @@ async def set_role(
 
 @router.patch("/users/{user_id}/active", response_model=UserOut)
 async def set_active(
-    user_id: int,
+    user_id: uuid.UUID,
     active: bool,
     session: AsyncSession = Depends(get_session),
     admin: User = Depends(require_admin),

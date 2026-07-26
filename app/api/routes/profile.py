@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import ProfileIn, ProfileOut
-from app.db.models import Profile
+from app.db.models import FreelancerProfile
 from app.db.session import get_session
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
@@ -12,7 +12,7 @@ router = APIRouter(prefix="/profile", tags=["profile"])
 
 
 @router.get("", response_model=ProfileOut)
-async def read_profile(session: AsyncSession = Depends(get_session)) -> Profile:
+async def read_profile(session: AsyncSession = Depends(get_session)) -> FreelancerProfile:
     user = await get_or_create_default_user(session)
     return await get_or_create_profile(session, user.id)
 
@@ -20,7 +20,7 @@ async def read_profile(session: AsyncSession = Depends(get_session)) -> Profile:
 @router.put("", response_model=ProfileOut)
 async def update_profile(
     payload: ProfileIn, session: AsyncSession = Depends(get_session)
-) -> Profile:
+) -> FreelancerProfile:
     """Replace the profile.
 
     Scores already stored are left alone — call ``POST /jobs/rescore`` to apply the new weights.

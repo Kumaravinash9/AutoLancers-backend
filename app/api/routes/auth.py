@@ -15,7 +15,7 @@ from app.auth.freelancer_oauth import (
     store_token,
 )
 from app.config import get_settings
-from app.db.models import OAuthToken
+from app.db.models import PlatformConnection
 from app.db.session import get_session
 from app.services.users import get_or_create_default_user
 
@@ -72,12 +72,12 @@ async def status(
 ) -> AuthStatus:
     user = await get_or_create_default_user(session)
     row = await session.scalar(
-        select(OAuthToken).where(
-            OAuthToken.user_id == user.id, OAuthToken.platform == platform
+        select(PlatformConnection).where(
+            PlatformConnection.user_id == user.id, PlatformConnection.platform == platform
         )
     )
     if row is None:
         return AuthStatus(connected=False, platform=platform, detail="No token stored")
     return AuthStatus(
-        connected=True, platform=platform, scope=row.scope, expires_at=row.expires_at
+        connected=True, platform=platform, scope=row.scope, expires_at=row.token_expires_at
     )

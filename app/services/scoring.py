@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.connectors.freelancer import JobPosting
-from app.db.models import Profile, utcnow
+from app.db.models import FreelancerProfile, utcnow
 
 # Anything older than this scores zero on recency.
 RECENCY_HORIZON_HOURS = 48.0
@@ -35,7 +35,9 @@ class ScoreResult:
     rejection_reason: str | None = None
 
 
-def score_job(job: JobPosting, profile: Profile, now: dt.datetime | None = None) -> ScoreResult:
+def score_job(
+    job: JobPosting, profile: FreelancerProfile, now: dt.datetime | None = None
+) -> ScoreResult:
     now = now or utcnow()
     haystack = _haystack(job)
 
@@ -80,7 +82,7 @@ def score_job(job: JobPosting, profile: Profile, now: dt.datetime | None = None)
 # --- hard filters -----------------------------------------------------------------
 
 
-def _hard_filter(job: JobPosting, profile: Profile, haystack: str) -> str | None:
+def _hard_filter(job: JobPosting, profile: FreelancerProfile, haystack: str) -> str | None:
     for term in profile.keywords_exclude or []:
         if term and _contains_term(haystack, term):
             return f"Excluded keyword: {term!r}"
@@ -104,9 +106,9 @@ def _hard_filter(job: JobPosting, profile: Profile, haystack: str) -> str | None
     return None
 
 
-def _budget_floor(job: JobPosting, profile: Profile) -> float | None:
+def _budget_floor(job: JobPosting, profile: FreelancerProfile) -> float | None:
     if job.budget_type == "hourly":
-        return profile.hourly_min or None
+        return profile.rate_min or None
     if job.budget_type == "fixed":
         return profile.fixed_project_min or None
     return None  # unknown type — don't guess which floor applies
@@ -117,7 +119,7 @@ def _budget_floor(job: JobPosting, profile: Profile) -> float | None:
 
 def _score_skills(
     job: JobPosting,
-    profile: Profile,
+    profile: FreelancerProfile,
     haystack: str,
     weight: float,
     reasons: list[dict[str, Any]],
@@ -156,7 +158,7 @@ def _score_skills(
 
 
 def _score_budget(
-    job: JobPosting, profile: Profile, weight: float, reasons: list[dict[str, Any]]
+    job: JobPosting, profile: FreelancerProfile, weight: float, reasons: list[dict[str, Any]]
 ) -> float:
     if weight <= 0:
         return 0.0
@@ -197,7 +199,7 @@ def _score_budget(
 
 
 def _score_competition(
-    job: JobPosting, profile: Profile, weight: float, reasons: list[dict[str, Any]]
+    job: JobPosting, profile: FreelancerProfile, weight: float, reasons: list[dict[str, Any]]
 ) -> float:
     if weight <= 0:
         return 0.0

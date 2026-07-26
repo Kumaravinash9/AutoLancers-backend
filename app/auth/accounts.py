@@ -10,6 +10,7 @@ link is presentation — the check that matters is the dependency on the route.
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 import bcrypt
 import jwt
@@ -95,7 +96,7 @@ async def current_user(
     except AuthError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
 
-    user = await session.get(User, int(payload["sub"]))
+    user = await session.get(User, uuid.UUID(payload["sub"]))
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account is not active.")
     return user

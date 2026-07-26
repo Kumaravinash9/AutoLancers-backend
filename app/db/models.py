@@ -1,12 +1,23 @@
-"""Database models.
+"""Database models — the multi-user data model from ``docs/target-schema.sql``.
 
-v1 runs single-user, but every table carries ``user_id`` from the first migration so the
-multi-tenant retrofit never has to move rows or re-key credentials.
+Two decisions from that schema drive everything here:
+
+**Projects are global; recommendations are per-user.** A posting on Freelancer.com is one row in
+``projects`` no matter how many people are watching for it. What differs per person is the score,
+the reasoning and the status, which live in ``recommendations``. Storing a copy of the posting per
+user would mean re-fetching and re-storing the same text a thousand times over.
+
+**Clients are not users.** People who post jobs exist only as columns on ``projects`` — we know
+them through a marketplace API, never as accounts here.
+
+UUID primary keys throughout: they don't leak how many users or jobs exist, and they can be minted
+without a round trip to the database.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 from enum import StrEnum
 from typing import Any
 
@@ -20,7 +31,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -28,109 +39,204 @@ def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
 
+def new_id() -> uuid.UUID:
+    return uuid.uuid4()
+
+
 class Base(DeclarativeBase):
     pass
 
 
+def _pk() -> Mapped[uuid.UUID]:
+    return mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+
+
+def _fk(target: str, **kw: Any) -> Mapped[uuid.UUID]:
+    return mapped_column(UUID(as_uuid=True), ForeignKey(target, ondelete="CASCADE"), **kw)
+
+
+# --- enumerations -------------------------------------------------------------------
+
+
 class Role(StrEnum):
-    """Roles are a closed set, checked server-side on every request.
-
-    Kept deliberately coarse: an `admin` operates the platform, a `user` operates their own
-    account. Anything finer would be invented complexity until there are real teams.
-    """
-
     USER = "user"
     ADMIN = "admin"
 
 
+class AccountType(StrEnum):
+    SOLO = "SOLO_FREELANCER"
+    AGENCY = "AGENCY"
+
+
+class AuthProvider(StrEnum):
+    EMAIL = "EMAIL"
+    GOOGLE = "GOOGLE"
+
+
+class DiscoveryMethod(StrEnum):
+    """How a posting reached us.
+
+    Upwork prohibits automated discovery, so anything from there arrives as pasted text. Recording
+    which is which keeps that distinction auditable rather than tribal knowledge.
+    """
+
+    API_POLL = "API_POLL"
+    PASTE_IN = "PASTE_IN"
+
+
+class RecommendationStatus(StrEnum):
+    NEW = "NEW"
+    VIEWED = "VIEWED"
+    APPLIED = "APPLIED"
+    DISMISSED = "DISMISSED"  # the user passed on it
+
+
+class ProposalStatus(StrEnum):
+    DRAFT = "DRAFT"
+    SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"  # the client said no — distinct from DISMISSED above
+    WITHDRAWN = "WITHDRAWN"
+
+
+class SubmittedVia(StrEnum):
+    API = "API"
+    MANUAL_COPY = "MANUAL_COPY"
+
+
+# --- accounts -----------------------------------------------------------------------
+
+
 class User(Base):
+    """An account on this product — a freelancer using the tool."""
+
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
-    # bcrypt digest. Nullable so the pre-auth single-user row stays valid until it gets a password.
-    password_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    id: Mapped[uuid.UUID] = _pk()
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Null when the account was created through Google and has never set a password.
+    password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    auth_provider: Mapped[str] = mapped_column(String(20), default=AuthProvider.EMAIL)
+    profile_image: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # A label only. An agency is still one account with one profile; real multi-seat support
+    # would need a memberships table, and pretending otherwise here would be a lie.
+    account_type: Mapped[str] = mapped_column(String(20), default=AccountType.SOLO)
+
     role: Mapped[str] = mapped_column(String(16), default=Role.USER, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    display_name: Mapped[str] = mapped_column(String(120), default="")
+
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
     last_login_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    profile: Mapped[FreelancerProfile | None] = relationship(
+        back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
+    connections: Mapped[list[PlatformConnection]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
     )
 
     @property
     def is_admin(self) -> bool:
         return self.role == Role.ADMIN
 
-    tokens: Mapped[list[OAuthToken]] = relationship(back_populates="user")
-    profile: Mapped[Profile | None] = relationship(back_populates="user", uselist=False)
 
+class PlatformConnection(Base):
+    """A user's OAuth link to one marketplace.
 
-class OAuthToken(Base):
-    """Per-user, per-platform credentials.
-
-    ``access_token`` and ``refresh_token`` hold Fernet ciphertext, never plaintext — read and
-    write them through ``app.auth.crypto`` rather than touching the columns directly.
+    Tokens hold Fernet ciphertext, never plaintext — read and write them through
+    ``app.auth.crypto``. Reputation lives here rather than on the profile because the same person
+    has different ratings on Freelancer.com and Upwork.
     """
 
-    __tablename__ = "oauth_tokens"
-    __table_args__ = (UniqueConstraint("user_id", "platform", name="uq_token_user_platform"),)
+    __tablename__ = "platform_connections"
+    __table_args__ = (UniqueConstraint("user_id", "platform", name="uq_connection_user_platform"),)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    platform: Mapped[str] = mapped_column(String(32), default="freelancer")
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = _fk("users.id", index=True)
 
-    access_token: Mapped[str] = mapped_column(Text)
-    refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
-    expires_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    platform: Mapped[str] = mapped_column(String(50), default="freelancer")
+    platform_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    platform_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    access_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refresh_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     scope: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_reviews: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    connected_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    token_expires_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
+    last_synced_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(30), default="ACTIVE")
 
-    user: Mapped[User] = relationship(back_populates="tokens")
+    user: Mapped[User] = relationship(back_populates="connections")
 
 
-class Profile(Base):
-    """Scoring configuration.
+class FreelancerProfile(Base):
+    """The matching and drafting profile. One per user.
 
-    Everything here is tuning surface — nothing downstream hardcodes a weight or threshold.
+    Scoring weights are explicit columns rather than keys inside a JSONB blob because they are the
+    tuning surface — the profile screen edits them directly, and burying them would make every
+    change a blind write.
     """
 
-    __tablename__ = "profiles"
+    __tablename__ = "freelancer_profiles"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
-    )
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = _fk("users.id", unique=True, index=True)
 
-    display_name: Mapped[str] = mapped_column(String(120), default="")
+    display_name: Mapped[str] = mapped_column(String(255), default="")
     headline: Mapped[str] = mapped_column(String(255), default="")
+    bio: Mapped[str] = mapped_column(Text, default="")
 
-    # [{"name": "next.js", "weight": 5}, ...]
     skills: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    portfolio: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    experience: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    education: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    tone_samples: Mapped[list[str]] = mapped_column(JSONB, default=list)
+
+    rate_min: Mapped[float] = mapped_column(Float, default=0.0)
+    rate_max: Mapped[float] = mapped_column(Float, default=0.0)
+    fixed_project_min: Mapped[float] = mapped_column(Float, default=0.0)
+    currency: Mapped[str] = mapped_column(String(10), default="USD")
+    availability: Mapped[str] = mapped_column(String(30), default="FULL_TIME")
 
     keywords_include: Mapped[list[str]] = mapped_column(JSONB, default=list)
     keywords_exclude: Mapped[list[str]] = mapped_column(JSONB, default=list)
-
-    fixed_project_min: Mapped[float] = mapped_column(Float, default=0.0)
-    hourly_min: Mapped[float] = mapped_column(Float, default=0.0)
-    currency: Mapped[str] = mapped_column(String(8), default="USD")
-
     max_existing_bids: Mapped[int] = mapped_column(Integer, default=25)
     min_match_score: Mapped[float] = mapped_column(Float, default=55.0)
 
-    # Component weights, summed and normalised at scoring time.
     weight_skills: Mapped[float] = mapped_column(Float, default=60.0)
     weight_budget: Mapped[float] = mapped_column(Float, default=20.0)
     weight_competition: Mapped[float] = mapped_column(Float, default=10.0)
     weight_recency: Mapped[float] = mapped_column(Float, default=10.0)
 
-    # Free text woven into the "about us" beat of the proposal.
     proposal_notes: Mapped[str] = mapped_column(Text, default="")
 
+    # Tokenised reference only. Never raw card or bank details.
+    payment_provider_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # When this freelancer's board was last recalculated — distinct from a connection's
+    # last_synced_at, which tracks the last pull from that platform's API.
+    last_synced_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(30), default="ACTIVE")
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -138,121 +244,236 @@ class Profile(Base):
     user: Mapped[User] = relationship(back_populates="profile")
 
 
-class CycleRun(Base):
-    """One completed poll cycle.
-
-    Without this the poller is unobservable: you can't tell "no good jobs today" apart from
-    "discovery has been failing for six hours", and both look identical from the queue.
-    """
-
-    __tablename__ = "cycle_runs"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-
-    started_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, index=True
-    )
-    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
-
-    fetched: Mapped[int] = mapped_column(Integer, default=0)
-    created: Mapped[int] = mapped_column(Integer, default=0)
-    updated: Mapped[int] = mapped_column(Integer, default=0)
-    rejected: Mapped[int] = mapped_column(Integer, default=0)
-    drafted: Mapped[int] = mapped_column(Integer, default=0)
-    draft_failures: Mapped[int] = mapped_column(Integer, default=0)
-
-    authenticated: Mapped[bool] = mapped_column(Boolean, default=False)
-    trigger: Mapped[str] = mapped_column(String(16), default="poll")  # poll | manual
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+# --- marketplace data ---------------------------------------------------------------
 
 
-class Job(Base):
-    """A normalised posting plus everything we derived from it."""
+class Project(Base):
+    """A posting ingested from a marketplace. Global — not owned by any user."""
 
-    __tablename__ = "jobs"
+    __tablename__ = "projects"
     __table_args__ = (
-        UniqueConstraint("user_id", "platform", "external_id", name="uq_job_user_platform_ext"),
+        UniqueConstraint("platform", "external_id", name="uq_project_platform_external"),
     )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    id: Mapped[uuid.UUID] = _pk()
 
-    platform: Mapped[str] = mapped_column(String(32), default="freelancer")
-    external_id: Mapped[str] = mapped_column(String(64))
+    platform: Mapped[str] = mapped_column(String(50), default="freelancer", index=True)
+    # Null for pasted text with no id of its own.
+    external_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    discovery_method: Mapped[str] = mapped_column(String(20), default=DiscoveryMethod.API_POLL)
+
+    client_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    client_rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    client_country: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    client_reviews_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     title: Mapped[str] = mapped_column(Text, default="")
     description: Mapped[str] = mapped_column(Text, default="")
-    url: Mapped[str] = mapped_column(Text, default="")
-    skills_listed: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    required_skills: Mapped[list[str]] = mapped_column(JSONB, default=list)
 
-    budget_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # fixed | hourly
-    budget_min: Mapped[float | None] = mapped_column(Float, nullable=True)
-    budget_max: Mapped[float | None] = mapped_column(Float, nullable=True)
-    currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    work_type: Mapped[str | None] = mapped_column(String(20), nullable=True)  # FIXED | HOURLY
+    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    min_budget: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_budget: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    bid_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # bid_count and friends as reported at fetch time.
+    bid_information: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+
+    project_url: Mapped[str] = mapped_column(Text, default="")
     posted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    bid_deadline: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    score: Mapped[float] = mapped_column(Float, default=0.0)
-    # Human-readable scoring trace: [{"label": ..., "detail": ..., "points": ...}, ...]
-    reasons: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
-    rejected: Mapped[bool] = mapped_column(Boolean, default=False)
-    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="OPEN", index=True)
 
-    proposal_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    proposal_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    proposal_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    proposal_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    proposal_drafted_at: Mapped[dt.datetime | None] = mapped_column(
+    # Fingerprint of the fields worth reacting to. Comparing it is how a re-fetch tells a genuine
+    # edit from the same posting seen again — `updated_at` alone only says when we last looked.
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_changed_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
-    # new -> drafted -> approved | dismissed | submitted.
-    # "submitted" is only ever reached through an explicit per-job confirmation.
-    status: Mapped[str] = mapped_column(String(16), default="new", index=True)
-
-    # Set only when a bid was actually placed through the API. `external_bid_id` is Freelancer's
-    # id for it, which is what makes a duplicate submission detectable rather than merely unlikely.
-    bid_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
-    bid_period_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    bid_submitted_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    external_bid_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-
-    first_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    refreshed_at: Mapped[dt.datetime] = mapped_column(
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
 
+    @property
+    def bid_count(self) -> int | None:
+        value = (self.bid_information or {}).get("bid_count")
+        return int(value) if isinstance(value, int | float) else None
+
+
+class Recommendation(Base):
+    """One user's verdict on one project: the score, the reasoning, and what they did about it."""
+
+    __tablename__ = "recommendations"
+    __table_args__ = (
+        UniqueConstraint(
+            "freelancer_id", "project_id", name="uq_recommendation_freelancer_project"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    freelancer_id: Mapped[uuid.UUID] = _fk("freelancer_profiles.id", index=True)
+    project_id: Mapped[uuid.UUID] = _fk("projects.id", index=True)
+
+    score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    # Per-component trace: [{"label": ..., "detail": ..., "points": ...}, ...]
+    reasons: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+
+    # A hard reject is the tool's decision; DISMISSED below is the user's. Keeping them apart is
+    # what lets the rejected view explain itself.
+    is_hard_rejected: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    status: Mapped[str] = mapped_column(String(30), default=RecommendationStatus.NEW, index=True)
+
+    # Set when the underlying posting changed after this was last reviewed, so a board can show
+    # "budget raised" or "now 40 bids" rather than looking identical to yesterday.
+    has_changes: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    changed_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    recommended_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    project: Mapped[Project] = relationship(lazy="joined")
+    proposal: Mapped[Proposal | None] = relationship(
+        back_populates="recommendation", uselist=False, lazy="joined"
+    )
+
+
+class Proposal(Base):
+    """A drafted or submitted bid."""
+
+    __tablename__ = "proposals"
+
+    id: Mapped[uuid.UUID] = _pk()
+    project_id: Mapped[uuid.UUID] = _fk("projects.id", index=True)
+    freelancer_id: Mapped[uuid.UUID] = _fk("freelancer_profiles.id", index=True)
+    recommendation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("recommendations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    proposal_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bid_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimated_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    milestones: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+
+    submitted_via: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default=ProposalStatus.DRAFT, index=True)
+
+    # The marketplace's own id for the bid. Its presence is what makes a duplicate submission
+    # detectable rather than merely unlikely.
+    external_bid_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # What the draft cost, kept per proposal so spend is attributable.
+    model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    drafted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    submitted_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    recommendation: Mapped[Recommendation | None] = relationship(back_populates="proposal")
+
+
+class ProposalAIVersion(Base):
+    """Every generated draft, kept because ``proposal_text`` is overwritten by hand-editing.
+
+    Comparing what the model wrote against what was actually sent is the only honest read on
+    whether drafts are improving.
+    """
+
+    __tablename__ = "proposal_ai_versions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    proposal_id: Mapped[uuid.UUID] = _fk("proposals.id", index=True)
+
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    generated_text: Mapped[str] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RecommendationFeedback(Base):
+    """Signal for improving match quality."""
+
+    __tablename__ = "recommendation_feedback"
+
+    id: Mapped[uuid.UUID] = _pk()
+    recommendation_id: Mapped[uuid.UUID] = _fk("recommendations.id", index=True)
+    feedback_type: Mapped[str] = mapped_column(String(30))  # LIKE | DISLIKE | APPLIED
+    comments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# --- normalised skill tags ----------------------------------------------------------
+
+
+class Skill(Base):
+    """Canonical skill tag. The JSONB profile field stays editable; this is its queryable index."""
+
+    __tablename__ = "skills"
+
+    id: Mapped[uuid.UUID] = _pk()
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    # The marketplace's own id, so a resolved skill needn't be resolved again every cycle.
+    external_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class FreelancerSkill(Base):
+    __tablename__ = "freelancer_skills"
+
+    freelancer_id: Mapped[uuid.UUID] = _fk("freelancer_profiles.id", primary_key=True)
+    skill_id: Mapped[uuid.UUID] = _fk("skills.id", primary_key=True, index=True)
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    tier: Mapped[str] = mapped_column(String(20), default="PRIMARY")
+
+
+class ProjectSkill(Base):
+    __tablename__ = "project_skills"
+
+    project_id: Mapped[uuid.UUID] = _fk("projects.id", primary_key=True)
+    skill_id: Mapped[uuid.UUID] = _fk("skills.id", primary_key=True, index=True)
+
+
+# --- preferences and billing --------------------------------------------------------
+
 
 class NotificationPreference(Base):
-    """Per-user channel opt-ins.
-
-    Email is the always-on baseline; the rest are opt-in and each carries the one credential its
-    channel needs. Modelled from ``docs/target-schema.sql`` §9.
-    """
+    """Per-user channel opt-ins. Email is the always-on baseline; the rest are opt-in."""
 
     __tablename__ = "notification_preferences"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
-    )
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = _fk("users.id", unique=True, index=True)
 
     email_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-
     slack_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     slack_webhook_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-
     whatsapp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     whatsapp_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
-
     teams_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     teams_webhook_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Don't wake someone at 3am for a 56-point match; only alert above their own bar.
+    # A channel toggle alone would wake someone for a 56-point match.
     min_score_to_notify: Mapped[float] = mapped_column(Float, default=70.0)
 
     updated_at: Mapped[dt.datetime] = mapped_column(
@@ -261,18 +482,12 @@ class NotificationPreference(Base):
 
 
 class Subscription(Base):
-    """Billing state. Modelled from ``docs/target-schema.sql`` §10.
-
-    Only Stripe identifiers are stored — never card details, which is the point of using a
-    provider at all.
-    """
+    """Billing state. Provider identifiers only — never card details."""
 
     __tablename__ = "subscriptions"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
-    )
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = _fk("users.id", unique=True, index=True)
 
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -280,7 +495,7 @@ class Subscription(Base):
     plan: Mapped[str] = mapped_column(String(50), default="free")
     status: Mapped[str] = mapped_column(String(30), default="trialing")
 
-    # A user-set ceiling on LLM spend, enforced before drafting rather than discovered on a bill.
+    # Enforced before drafting rather than discovered on a bill.
     monthly_budget_limit: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     current_period_start: Mapped[dt.datetime | None] = mapped_column(
@@ -295,71 +510,35 @@ class Subscription(Base):
     )
 
 
-class ProposalVersion(Base):
-    """Every AI draft ever generated for a job. Modelled from ``docs/target-schema.sql`` §7.
+# --- operations ---------------------------------------------------------------------
 
-    ``jobs.proposal_text`` holds the current draft and is overwritten by edits, so without this
-    the original generation is lost — and comparing what the model wrote against what you sent is
-    the only honest way to judge whether the drafts are getting better.
+
+class CycleRun(Base):
+    """One completed poll cycle.
+
+    Not in the target schema, kept because without it the poller is unobservable: "nothing matched
+    today" and "discovery has been failing for six hours" look identical from the board.
     """
 
-    __tablename__ = "proposal_versions"
+    __tablename__ = "cycle_runs"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
-
-    version: Mapped[int] = mapped_column(Integer, default=1)
-    generated_text: Mapped[str] = mapped_column(Text)
-    model: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-
-class Skill(Base):
-    """Canonical skill tag, e.g. "React".
-
-    From ``docs/target-schema.sql`` §4b. The JSONB ``Profile.skills`` stays the editable source of
-    truth; these rows are the queryable index of it, so matching can happen in SQL instead of by
-    loading every profile into Python.
-    """
-
-    __tablename__ = "skills"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
-    # Freelancer's own numeric id, so a resolved skill doesn't need re-resolving every cycle.
-    freelancer_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-
-
-class ProfileSkill(Base):
-    """Weighted link from a profile to a canonical skill.
-
-    Named for our ``profiles`` table rather than the target schema's ``freelancer_profiles``;
-    renaming the table is part of the pending cutover, not of adding this index.
-    """
-
-    __tablename__ = "profile_skills"
-
-    profile_id: Mapped[int] = mapped_column(
-        ForeignKey("profiles.id", ondelete="CASCADE"), primary_key=True
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
-    skill_id: Mapped[int] = mapped_column(
-        ForeignKey("skills.id", ondelete="CASCADE"), primary_key=True, index=True
+
+    started_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
     )
-    weight: Mapped[float] = mapped_column(Float, default=1.0)
-    tier: Mapped[str] = mapped_column(String(20), default="primary")  # primary | secondary
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
 
+    fetched: Mapped[int] = mapped_column(Integer, default=0)
+    created: Mapped[int] = mapped_column(Integer, default=0)
+    updated: Mapped[int] = mapped_column(Integer, default=0)
+    rejected: Mapped[int] = mapped_column(Integer, default=0)
+    drafted: Mapped[int] = mapped_column(Integer, default=0)
+    draft_failures: Mapped[int] = mapped_column(Integer, default=0)
 
-class JobSkill(Base):
-    """Skills a posting asked for, as canonical tags."""
-
-    __tablename__ = "job_skills"
-
-    job_id: Mapped[int] = mapped_column(
-        ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
-    )
-    skill_id: Mapped[int] = mapped_column(
-        ForeignKey("skills.id", ondelete="CASCADE"), primary_key=True, index=True
-    )
+    authenticated: Mapped[bool] = mapped_column(Boolean, default=False)
+    trigger: Mapped[str] = mapped_column(String(16), default="poll")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)

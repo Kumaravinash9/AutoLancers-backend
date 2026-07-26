@@ -36,7 +36,9 @@ class Settings(BaseSettings):
     enable_bidding: bool = False
 
     frontend_origin: str = "http://localhost:3000"
-    poll_interval_seconds: int = 25
+    # Every 30 minutes. Freelancer's terms ask for cached data to be refreshed at least
+    # daily, and a tighter loop mostly re-reads postings that haven't changed.
+    poll_interval_seconds: int = 1800
     scheduler_enabled: bool = True
 
 

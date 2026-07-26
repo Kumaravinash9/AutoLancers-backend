@@ -1,22 +1,40 @@
-"""The ingest cycle: fetch -> normalise -> score -> persist -> draft.
+"""The ingest cycle: fetch -> normalise -> upsert project -> score -> recommend -> draft.
 
 Nothing in here is allowed to raise past ``run_cycle``. The poller calls this every ~25s forever,
 so one bad response, one rate limit, or one refused draft must cost us that item and nothing more.
+
+A posting is stored **once**, in ``projects``. What each user thinks of it lives in
+``recommendations``. That split is why adding the thousandth user costs a thousand score rows and
+not a thousand copies of every description.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.freelancer_oauth import OAuthError, get_valid_access_token
 from app.connectors.freelancer import FreelancerAPIError, FreelancerClient, JobPosting
-from app.db.models import CycleRun, Job, Profile, ProposalVersion, utcnow
+from app.db.models import (
+    CycleRun,
+    DiscoveryMethod,
+    FreelancerProfile,
+    Project,
+    Proposal,
+    ProposalAIVersion,
+    ProposalStatus,
+    Recommendation,
+    RecommendationStatus,
+    utcnow,
+)
 from app.services.drafting import DraftingError, draft_proposal
 from app.services.scoring import score_job
 from app.services.users import get_or_create_default_user, get_or_create_profile
@@ -34,7 +52,9 @@ MAX_DRAFTS_PER_CYCLE = 5
 class CycleReport:
     fetched: int = 0
     new: int = 0
+    # "updated" counts postings whose content actually moved, not every one seen again.
     updated: int = 0
+    unchanged: int = 0
     rejected: int = 0
     drafted: int = 0
     draft_failures: int = 0
@@ -47,20 +67,15 @@ class CycleReport:
 
 
 async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport:
-    """Run one cycle and record what happened.
-
-    The record is the point: from the queue alone, "nothing matched today" and "discovery has
-    been failing for six hours" look identical.
-    """
+    """Run one cycle and record what happened."""
     started = time.monotonic()
     report = CycleReport()
 
     user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
-    # A token is optional. The public project search works unauthenticated — it just returns
-    # fewer fields and has lower rate limits — so an unconnected account degrades to reduced
-    # discovery rather than no product at all.
+    # A token is optional: the public project search works unauthenticated, so an unconnected
+    # account degrades to reduced discovery rather than no product at all.
     try:
         token = await get_valid_access_token(session, user.id)
     except OAuthError as exc:
@@ -71,8 +86,8 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
     client = FreelancerClient(access_token=token)
 
     # Filter server-side by the profile's skills. Without this the search returns whatever was
-    # posted most recently across the entire marketplace, which for a specialist profile is
-    # overwhelmingly irrelevant — you end up scoring logo and SEO gigs against a Next.js profile.
+    # posted most recently across the whole marketplace, which for a specialist profile is
+    # overwhelmingly irrelevant.
     skill_ids: list[int] = []
     try:
         names = [s["name"] for s in (profile.skills or []) if s.get("name")]
@@ -85,7 +100,6 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
                     ", ".join(unmatched),
                 )
     except FreelancerAPIError as exc:
-        # Losing the catalogue is not fatal — fall back to an unfiltered search.
         logger.warning("Could not resolve skill filters, searching unfiltered: %s", exc)
 
     try:
@@ -100,141 +114,185 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
 
     for posting in postings:
         try:
-            created, rejected = await _upsert_scored(session, user.id, profile, posting)
+            created, rejected, changed = await _ingest(session, profile, posting)
         except Exception:  # one malformed posting must not end the cycle
             logger.exception("Failed to store posting %s", posting.external_id)
             continue
-        if created:
-            report.new += 1
-        else:
-            report.updated += 1
-        if rejected:
-            report.rejected += 1
+        report.new += int(created)
+        report.updated += int(changed)
+        report.unchanged += int(not created and not changed)
+        report.rejected += int(rejected)
 
+    profile.last_synced_at = utcnow()
     await session.commit()
 
-    report.drafted, report.draft_failures = await _draft_pending(session, user.id, profile)
+    report.drafted, report.draft_failures = await _draft_pending(session, profile)
 
     await _record(session, user.id, report, started, trigger)
 
     logger.info(
-        "Cycle: fetched=%d new=%d updated=%d drafted=%d draft_failures=%d",
+        "Cycle: fetched=%d new=%d changed=%d unchanged=%d drafted=%d draft_failures=%d",
         report.fetched,
         report.new,
         report.updated,
+        report.unchanged,
         report.drafted,
         report.draft_failures,
     )
     return report
 
 
-async def _upsert_scored(
-    session: AsyncSession, user_id: int, profile: Profile, posting: JobPosting
-) -> tuple[bool, bool]:
-    """Insert or update one posting with a fresh score. Returns ``(created, rejected)``.
+def _fingerprint(posting: JobPosting) -> str:
+    """Hash of the fields a freelancer would care about changing."""
+    payload = json.dumps(
+        [
+            posting.title,
+            posting.description,
+            posting.budget_min,
+            posting.budget_max,
+            posting.bid_count,
+            sorted(posting.skills_listed or []),
+        ],
+        default=str,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
-    Updating matters: an existing row's bid count and description change, and re-scoring on every
-    sighting is what makes profile tuning actually take effect on jobs already in the table.
+
+async def _ingest(
+    session: AsyncSession, profile: FreelancerProfile, posting: JobPosting
+) -> tuple[bool, bool, bool]:
+    """Upsert the project, then this profile's recommendation for it.
+
+    Returns ``(created, rejected, content_changed)``. Re-scoring on every sighting is what makes a
+    profile change take effect on postings already stored.
     """
-    result = score_job(posting, profile)
-
-    row = await session.scalar(
-        select(Job).where(
-            Job.user_id == user_id,
-            Job.platform == posting.platform,
-            Job.external_id == posting.external_id,
+    project = await session.scalar(
+        select(Project).where(
+            Project.platform == posting.platform, Project.external_id == posting.external_id
         )
     )
-    created = row is None
-    if row is None:
-        row = Job(
-            user_id=user_id,
+    if project is None:
+        project = Project(
             platform=posting.platform,
             external_id=posting.external_id,
-            first_seen_at=utcnow(),
+            discovery_method=DiscoveryMethod.API_POLL,
         )
-        session.add(row)
+        session.add(project)
 
-    row.title = posting.title
-    row.description = posting.description
-    row.url = posting.url
-    row.skills_listed = posting.skills_listed
-    row.budget_type = posting.budget_type
-    row.budget_min = posting.budget_min
-    row.budget_max = posting.budget_max
-    row.currency = posting.currency
-    row.bid_count = posting.bid_count
-    row.posted_at = posting.posted_at
-    row.refreshed_at = utcnow()
+    # Compare a fingerprint of the fields worth reacting to. Re-fetching the same posting every
+    # half hour would otherwise look like a change every time, and "updated" would mean nothing.
+    incoming_hash = _fingerprint(posting)
+    content_changed = project.content_hash is not None and project.content_hash != incoming_hash
 
-    row.score = result.score
-    row.reasons = result.reasons
-    row.rejected = result.rejected
-    row.rejection_reason = result.rejection_reason
+    project.title = posting.title
+    project.description = posting.description
+    project.project_url = posting.url
+    project.required_skills = posting.skills_listed
+    project.work_type = posting.budget_type
+    project.min_budget = posting.budget_min
+    project.max_budget = posting.budget_max
+    project.currency = posting.currency
+    project.bid_information = {"bid_count": posting.bid_count}
+    project.posted_at = posting.posted_at
+    project.content_hash = incoming_hash
+    project.updated_at = utcnow()
+    if content_changed:
+        project.last_changed_at = utcnow()
 
-    # Never walk back a decision you've already made about a job.
-    if row.status in ("new", "drafted"):
-        row.status = "drafted" if row.proposal_text else "new"
+    # The recommendation's FK needs the project's id, which only exists after a flush.
+    await session.flush()
 
-    return created, result.rejected
+    result = score_job(posting, profile)
+
+    recommendation = await session.scalar(
+        select(Recommendation).where(
+            Recommendation.freelancer_id == profile.id,
+            Recommendation.project_id == project.id,
+        )
+    )
+    created = recommendation is None
+    if recommendation is None:
+        recommendation = Recommendation(freelancer_id=profile.id, project_id=project.id)
+        session.add(recommendation)
+
+    recommendation.score = result.score
+    recommendation.reasons = result.reasons
+    recommendation.is_hard_rejected = result.rejected
+    recommendation.rejection_reason = result.rejection_reason
+    recommendation.updated_at = utcnow()
+
+    # Flag it only if the posting genuinely moved and the user has already looked — telling
+    # someone a job they've never opened has "changed" is noise.
+    if content_changed and not created and recommendation.status != RecommendationStatus.NEW:
+        recommendation.has_changes = True
+        recommendation.changed_at = utcnow()
+
+    return created, result.rejected, content_changed
 
 
-async def _draft_pending(
-    session: AsyncSession, user_id: int, profile: Profile
-) -> tuple[int, int]:
-    """Draft proposals for the best undrafted, unrejected jobs."""
+async def _draft_pending(session: AsyncSession, profile: FreelancerProfile) -> tuple[int, int]:
+    """Draft proposals for the best recommendations that don't have one yet."""
+    drafted_ids = select(Proposal.recommendation_id).where(
+        Proposal.recommendation_id.is_not(None)
+    )
     rows = (
-        await session.scalars(
-            select(Job)
-            .where(
-                Job.user_id == user_id,
-                Job.rejected.is_(False),
-                Job.proposal_text.is_(None),
-                Job.status == "new",
+        (
+            await session.scalars(
+                select(Recommendation)
+                .where(
+                    Recommendation.freelancer_id == profile.id,
+                    Recommendation.is_hard_rejected.is_(False),
+                    Recommendation.status == RecommendationStatus.NEW,
+                    Recommendation.id.not_in(drafted_ids),
+                )
+                .order_by(Recommendation.score.desc())
+                .limit(MAX_DRAFTS_PER_CYCLE)
             )
-            .order_by(Job.score.desc())
-            .limit(MAX_DRAFTS_PER_CYCLE)
         )
-    ).all()
+        .unique()
+        .all()
+    )
 
     drafted = failures = 0
-    for row in rows:
+    for rec in rows:
         try:
-            draft = await draft_proposal(_to_posting(row), profile)
+            draft = await draft_proposal(_to_posting(rec.project), profile)
         except DraftingError as exc:
             failures += 1
-            logger.warning("Draft failed for job %s: %s", row.external_id, exc)
+            logger.warning("Draft failed for project %s: %s", rec.project.external_id, exc)
             continue
         except Exception:
             failures += 1
-            logger.exception("Unexpected drafting error for job %s", row.external_id)
+            logger.exception("Unexpected drafting error for project %s", rec.project.external_id)
             continue
+
+        proposal = Proposal(
+            project_id=rec.project_id,
+            freelancer_id=profile.id,
+            recommendation_id=rec.id,
+            proposal_text=draft.text,
+            status=ProposalStatus.DRAFT,
+            model=draft.model,
+            input_tokens=draft.input_tokens,
+            output_tokens=draft.output_tokens,
+            drafted_at=utcnow(),
+        )
+        session.add(proposal)
+        await session.flush()
 
         # Keep the generation before any hand-editing overwrites it: comparing what the model
         # wrote against what was actually sent is the only honest read on draft quality.
-        version = (
-            await session.scalar(
-                select(func.count(ProposalVersion.id)).where(ProposalVersion.job_id == row.id)
-            )
-            or 0
-        ) + 1
         session.add(
-            ProposalVersion(
-                job_id=row.id,
-                version=version,
+            ProposalAIVersion(
+                proposal_id=proposal.id,
+                version=1,
                 generated_text=draft.text,
                 model=draft.model,
                 input_tokens=draft.input_tokens,
                 output_tokens=draft.output_tokens,
             )
         )
-
-        row.proposal_text = draft.text
-        row.proposal_model = draft.model
-        row.proposal_input_tokens = draft.input_tokens
-        row.proposal_output_tokens = draft.output_tokens
-        row.proposal_drafted_at = utcnow()
-        row.status = "drafted"
         drafted += 1
 
     if drafted:
@@ -242,33 +300,39 @@ async def _draft_pending(
     return drafted, failures
 
 
-async def rescore_all(session: AsyncSession, user_id: int, profile: Profile) -> int:
-    """Re-run scoring over every stored job. Called after a profile change."""
-    rows = (await session.scalars(select(Job).where(Job.user_id == user_id))).all()
+async def rescore_all(session: AsyncSession, profile: FreelancerProfile) -> int:
+    """Re-run scoring over every stored recommendation. Called after a profile change."""
+    rows = (
+        (
+            await session.scalars(
+                select(Recommendation).where(Recommendation.freelancer_id == profile.id)
+            )
+        )
+        .unique()
+        .all()
+    )
 
-    for row in rows:
-        result = score_job(_to_posting(row), profile)
-        row.score = result.score
-        row.reasons = result.reasons
-        row.rejected = result.rejected
-        row.rejection_reason = result.rejection_reason
+    for rec in rows:
+        result = score_job(_to_posting(rec.project), profile)
+        rec.score = result.score
+        rec.reasons = result.reasons
+        rec.is_hard_rejected = result.rejected
+        rec.rejection_reason = result.rejection_reason
 
     await session.commit()
     return len(rows)
 
 
-async def prune_stale_jobs(session: AsyncSession) -> int:
-    """Drop rows not seen in the last 24h, per Freelancer's cached-data refresh requirement.
+async def prune_stale_projects(session: AsyncSession) -> int:
+    """Drop projects not seen in the last 24h, per Freelancer's cached-data refresh requirement.
 
-    Jobs you've acted on are kept — they're your record, not cached platform data.
+    Anything a user drafted or bid on is kept — that's their record, not cached platform data.
     """
     cutoff = utcnow() - STALE_AFTER
+    acted_on = select(Proposal.project_id).distinct()
     rows = (
         await session.scalars(
-            select(Job).where(
-                Job.refreshed_at < cutoff,
-                Job.status.notin_(("approved", "dismissed")),
-            )
+            select(Project).where(Project.updated_at < cutoff, Project.id.not_in(acted_on))
         )
     ).all()
 
@@ -280,25 +344,12 @@ async def prune_stale_jobs(session: AsyncSession) -> int:
     return len(rows)
 
 
-def _to_posting(row: Job) -> JobPosting:
-    return JobPosting(
-        platform=row.platform,
-        external_id=row.external_id,
-        title=row.title,
-        description=row.description,
-        url=row.url,
-        skills_listed=row.skills_listed or [],
-        budget_type=row.budget_type,
-        budget_min=row.budget_min,
-        budget_max=row.budget_max,
-        currency=row.currency,
-        bid_count=row.bid_count,
-        posted_at=row.posted_at,
-    )
-
-
 async def _record(
-    session: AsyncSession, user_id: int, report: CycleReport, started: float, trigger: str
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    report: CycleReport,
+    started: float,
+    trigger: str,
 ) -> None:
     """Persist the cycle. A failure to record must never turn a good cycle into a bad one."""
     try:
@@ -320,3 +371,25 @@ async def _record(
         await session.commit()
     except Exception:
         logger.exception("Could not record cycle run")
+
+
+def _to_posting(project: Project) -> JobPosting:
+    """Back to the platform-neutral shape scoring and drafting work with."""
+    return JobPosting(
+        platform=project.platform,
+        external_id=project.external_id or "",
+        title=project.title,
+        description=project.description,
+        url=project.project_url,
+        skills_listed=project.required_skills or [],
+        budget_type=project.work_type,
+        budget_min=project.min_budget,
+        budget_max=project.max_budget,
+        currency=project.currency,
+        bid_count=project.bid_count,
+        posted_at=project.posted_at,
+    )
+
+
+# The scheduler imports this name; keep it stable across the rename.
+prune_stale_jobs = prune_stale_projects
