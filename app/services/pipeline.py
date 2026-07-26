@@ -11,12 +11,12 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.freelancer_oauth import OAuthError, get_valid_access_token
 from app.connectors.freelancer import FreelancerAPIError, FreelancerClient, JobPosting
-from app.db.models import CycleRun, Job, Profile, utcnow
+from app.db.models import CycleRun, Job, Profile, ProposalVersion, utcnow
 from app.services.drafting import DraftingError, draft_proposal
 from app.services.scoring import score_job
 from app.services.users import get_or_create_default_user, get_or_create_profile
@@ -209,6 +209,25 @@ async def _draft_pending(
             failures += 1
             logger.exception("Unexpected drafting error for job %s", row.external_id)
             continue
+
+        # Keep the generation before any hand-editing overwrites it: comparing what the model
+        # wrote against what was actually sent is the only honest read on draft quality.
+        version = (
+            await session.scalar(
+                select(func.count(ProposalVersion.id)).where(ProposalVersion.job_id == row.id)
+            )
+            or 0
+        ) + 1
+        session.add(
+            ProposalVersion(
+                job_id=row.id,
+                version=version,
+                generated_text=draft.text,
+                model=draft.model,
+                input_tokens=draft.input_tokens,
+                output_tokens=draft.output_tokens,
+            )
+        )
 
         row.proposal_text = draft.text
         row.proposal_model = draft.model

@@ -39,3 +39,7 @@ select = ["E", "F", "I", "UP", "B"]
 # B008 flags FastAPI's `Depends(...)` in argument defaults, which is the framework's
 # intended pattern rather than the mutable-default bug the rule exists to catch.
 ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic writes these; reformatting generated migrations adds churn without adding clarity.
+"alembic/versions/*" = ["E501", "I001"]

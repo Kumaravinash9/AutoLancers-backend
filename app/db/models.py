@@ -225,3 +225,93 @@ class Job(Base):
     refreshed_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class NotificationPreference(Base):
+    """Per-user channel opt-ins.
+
+    Email is the always-on baseline; the rest are opt-in and each carries the one credential its
+    channel needs. Modelled from ``docs/target-schema.sql`` §9.
+    """
+
+    __tablename__ = "notification_preferences"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
+    )
+
+    email_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    slack_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    slack_webhook_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    whatsapp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    whatsapp_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+    teams_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    teams_webhook_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Don't wake someone at 3am for a 56-point match; only alert above their own bar.
+    min_score_to_notify: Mapped[float] = mapped_column(Float, default=70.0)
+
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class Subscription(Base):
+    """Billing state. Modelled from ``docs/target-schema.sql`` §10.
+
+    Only Stripe identifiers are stored — never card details, which is the point of using a
+    provider at all.
+    """
+
+    __tablename__ = "subscriptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
+    )
+
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    plan: Mapped[str] = mapped_column(String(50), default="free")
+    status: Mapped[str] = mapped_column(String(30), default="trialing")
+
+    # A user-set ceiling on LLM spend, enforced before drafting rather than discovered on a bill.
+    monthly_budget_limit: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    current_period_start: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    current_period_end: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ProposalVersion(Base):
+    """Every AI draft ever generated for a job. Modelled from ``docs/target-schema.sql`` §7.
+
+    ``jobs.proposal_text`` holds the current draft and is overwritten by edits, so without this
+    the original generation is lost — and comparing what the model wrote against what you sent is
+    the only honest way to judge whether the drafts are getting better.
+    """
+
+    __tablename__ = "proposal_versions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    generated_text: Mapped[str] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
