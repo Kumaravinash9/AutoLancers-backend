@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import BidAvailabilityOut, BidRequest, BidResult, JobOut, JobPatch
@@ -17,6 +17,7 @@ from app.db.models import (
     PlatformConnection,
     Project,
     Proposal,
+    ProposalAIVersion,
     ProposalStatus,
     Recommendation,
     RecommendationStatus,
@@ -31,7 +32,8 @@ from app.services.bidding import (
     check_availability,
     submit_bid_for_recommendation,
 )
-from app.services.pipeline import rescore_all
+from app.services.drafting import DraftingError, draft_proposal
+from app.services.pipeline import _to_posting, rescore_all
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -221,3 +223,61 @@ async def _owned(session: AsyncSession, job_id: uuid.UUID) -> Recommendation:
 
 # Kept so the enum values used by the frontend stay discoverable from one place.
 STATUSES = [s.value for s in RecommendationStatus]
+
+
+@router.post("/{job_id}/draft", response_model=JobOut)
+async def draft(job_id: uuid.UUID, session: AsyncSession = Depends(get_session)) -> JobOut:
+    """Write a proposal for this job now, rather than waiting for the poller to reach it.
+
+    The cycle only drafts the top few per run, so a job further down the board would otherwise
+    never get one. Re-running replaces the current text and keeps the previous generation as a
+    version, so regenerating is never destructive.
+    """
+    rec = await _owned(session, job_id)
+    profile = await _profile_for(session, None)
+
+    try:
+        generated = await draft_proposal(_to_posting(rec.project), profile)
+    except DraftingError as exc:
+        # 502: the failure is upstream at the model provider, not in the request.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    proposal = rec.proposal
+    if proposal is None:
+        proposal = Proposal(
+            project_id=rec.project_id,
+            freelancer_id=profile.id,
+            recommendation_id=rec.id,
+            status=ProposalStatus.DRAFT,
+        )
+        session.add(proposal)
+        await session.flush()
+
+    version = (
+        await session.scalar(
+            select(func.count(ProposalAIVersion.id)).where(
+                ProposalAIVersion.proposal_id == proposal.id
+            )
+        )
+        or 0
+    ) + 1
+    session.add(
+        ProposalAIVersion(
+            proposal_id=proposal.id,
+            version=version,
+            generated_text=generated.text,
+            model=generated.model,
+            input_tokens=generated.input_tokens,
+            output_tokens=generated.output_tokens,
+        )
+    )
+
+    proposal.proposal_text = generated.text
+    proposal.model = generated.model
+    proposal.input_tokens = generated.input_tokens
+    proposal.output_tokens = generated.output_tokens
+    proposal.drafted_at = utcnow()
+
+    await session.commit()
+    await session.refresh(rec)
+    return _flatten(rec)

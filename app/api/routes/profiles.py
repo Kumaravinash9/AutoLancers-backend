@@ -18,7 +18,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.schemas import ConnectionOut, ProfileCard, ProfileDetail, ProfileIn, ProfileOut
+from app.api.schemas import (
+    ConnectionOut,
+    FullSyncOut,
+    ProfileCard,
+    ProfileDetail,
+    ProfileIn,
+    ProfileOut,
+)
 from app.db.models import (
     FreelancerProfile,
     PlatformConnection,
@@ -29,6 +36,8 @@ from app.db.models import (
     utcnow,
 )
 from app.db.session import get_session
+from app.services.bid_sync import sync_bids
+from app.services.pipeline import run_cycle
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
 router = APIRouter(tags=["profiles"])
@@ -221,3 +230,45 @@ async def update_profile(
     await session.commit()
     await session.refresh(profile)
     return _out(profile)
+
+
+@router.post("/profiles/{profile_id}/sync", response_model=FullSyncOut)
+async def sync_everything(
+    profile_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+) -> FullSyncOut:
+    """Refresh everything for this profile: new work from the marketplace, and your own results.
+
+    Run in that order deliberately. Discovery can create the project a bid points at, so doing it
+    first means fewer bids arrive referencing something we have to fetch separately.
+
+    Each half is reported on its own. They fail for different reasons — discovery can be rate
+    limited while the bid pull is fine, or the token can lack scope for one and not the other —
+    and a single "sync failed" would hide which.
+    """
+    user = await get_or_create_default_user(session)
+    profile = await session.scalar(
+        select(FreelancerProfile).where(
+            FreelancerProfile.id == profile_id, FreelancerProfile.user_id == user.id
+        )
+    )
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    board = await run_cycle(session, trigger="manual")
+    # A failed board fetch must not stop the bid pull: they are independent.
+    bids = await sync_bids(session, user.id, profile)
+
+    await session.refresh(profile)
+    return FullSyncOut(
+        board_fetched=board.fetched,
+        board_new=board.new,
+        board_changed=board.updated,
+        board_drafted=board.drafted,
+        board_error=board.error,
+        bids_fetched=bids.fetched,
+        bids_imported=bids.imported,
+        outcomes_updated=bids.outcomes_updated,
+        bids_error=bids.error,
+        last_synced_at=profile.last_synced_at,
+        bids_synced_at=profile.bids_synced_at,
+    )

@@ -325,3 +325,26 @@ class ProfileDetail(ProfileCard):
     bids_synced_at: dt.datetime | None
     created_at: dt.datetime
     updated_at: dt.datetime
+
+
+
+class FullSyncOut(BaseModel):
+    """Result of syncing everything for a profile.
+
+    Both halves report separately even though one button triggers them: a marketplace fetch and a
+    bid pull fail for different reasons, and collapsing them into one status would hide which.
+    """
+
+    board_fetched: int
+    board_new: int
+    board_changed: int
+    board_drafted: int
+    board_error: str | None
+
+    bids_fetched: int
+    bids_imported: int
+    outcomes_updated: int
+    bids_error: str | None
+
+    last_synced_at: dt.datetime | None
+    bids_synced_at: dt.datetime | None
