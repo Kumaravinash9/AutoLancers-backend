@@ -255,7 +255,9 @@ class FreelancerProfile(Base):
 
     keywords_include: Mapped[list[str]] = mapped_column(JSONB, default=list)
     keywords_exclude: Mapped[list[str]] = mapped_column(JSONB, default=list)
-    max_existing_bids: Mapped[int] = mapped_column(Integer, default=25)
+    # The bid count at which competition scores half marks. Not a cap: a crowded posting loses
+    # points, it is never hidden. See ``scoring._score_competition``.
+    crowded_at_bids: Mapped[int] = mapped_column(Integer, default=25)
     min_match_score: Mapped[float] = mapped_column(Float, default=55.0)
 
     weight_skills: Mapped[float] = mapped_column(Float, default=60.0)

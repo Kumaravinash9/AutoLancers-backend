@@ -91,10 +91,6 @@ def _hard_filter(job: JobPosting, profile: FreelancerProfile, haystack: str) -> 
     if includes and not any(_contains_term(haystack, t) for t in includes):
         return f"No required keyword present (need one of: {', '.join(includes)})"
 
-    if profile.max_existing_bids and job.bid_count is not None:
-        if job.bid_count > profile.max_existing_bids:
-            return f"{job.bid_count} bids already, cap is {profile.max_existing_bids}"
-
     floor = _budget_floor(job, profile)
     if floor is not None and job.budget_max is not None and job.budget_max < floor:
         currency = job.currency or profile.currency
@@ -211,8 +207,16 @@ def _score_competition(
         )
         return earned
 
-    cap = profile.max_existing_bids or 25
-    fraction = max(0.0, 1.0 - job.bid_count / cap)
+    # Competition costs points; it does not disqualify. A hard cap threw away 59 of 75 postings
+    # on a normal day — including the profile's only won job, at 50 bids — because postings on
+    # this board routinely pass 70 bids within the hour. Being crowded is a reason to rank a job
+    # lower, not a reason to hide it.
+    #
+    # Decay is hyperbolic rather than linear so it never bottoms out: a 30-bid job and a 300-bid
+    # job have to be distinguishable, which subtraction against a cap cannot do once both are
+    # past it. ``crowded_at_bids`` is the count that scores half marks.
+    reference = profile.crowded_at_bids or 25
+    fraction = reference / (reference + job.bid_count)
     earned = weight * fraction
     reasons.append(
         {

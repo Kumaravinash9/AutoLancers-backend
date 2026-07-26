@@ -88,7 +88,7 @@ class ProfileOut(BaseModel):
     fixed_project_min: float
     rate_min: float
     currency: str
-    max_existing_bids: int
+    crowded_at_bids: int
     min_match_score: float
     weight_skills: float
     weight_budget: float
@@ -115,7 +115,7 @@ class ProfileIn(BaseModel):
     fixed_project_min: float = 0.0
     rate_min: float = 0.0
     currency: str = "USD"
-    max_existing_bids: int = 25
+    crowded_at_bids: int = 25
     min_match_score: float = 55.0
     weight_skills: float = 60.0
     weight_budget: float = 20.0
@@ -333,7 +333,7 @@ class ProfileDetail(ProfileCard):
     keywords_include: list[str]
     keywords_exclude: list[str]
     fixed_project_min: float
-    max_existing_bids: int
+    crowded_at_bids: int
     min_match_score: float
     weight_skills: float
     weight_budget: float

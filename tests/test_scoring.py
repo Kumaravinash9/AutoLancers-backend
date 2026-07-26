@@ -28,7 +28,7 @@ def make_profile(**overrides) -> FreelancerProfile:
         fixed_project_min=500.0,
         rate_min=25.0,
         currency="USD",
-        max_existing_bids=25,
+        crowded_at_bids=25,
         min_match_score=55.0,
         weight_skills=60.0,
         weight_budget=20.0,
@@ -76,10 +76,15 @@ class TestHardFilters:
         profile = make_profile(keywords_include=["next.js"])
         assert not score_job(make_job(), profile, now=NOW).rejected
 
-    def test_too_many_bids_rejects(self):
-        result = score_job(make_job(bid_count=99), make_profile(), now=NOW)
-        assert result.rejected
-        assert "99 bids" in result.rejection_reason
+    def test_a_crowded_post_is_not_rejected(self):
+        """Competition costs points; it never disqualifies.
+
+        A cap here threw away 59 of 75 real postings in one day, including the only job this
+        profile has won, at 50 bids. Postings on this board pass 70 bids within the hour, so a
+        gate on bid count is a gate on the whole board.
+        """
+        result = score_job(make_job(bid_count=99), make_profile(min_match_score=0), now=NOW)
+        assert not result.rejected
 
     def test_budget_below_floor_rejects(self):
         result = score_job(make_job(budget_max=100.0), make_profile(), now=NOW)
@@ -119,6 +124,14 @@ class TestScoring:
         few = score_job(make_job(bid_count=2), make_profile(), now=NOW)
         many = score_job(make_job(bid_count=20), make_profile(), now=NOW)
         assert few.score > many.score
+
+    def test_crowding_still_separates_jobs_far_past_the_old_cap(self):
+        """The reason the decay is hyperbolic: subtraction against a cap floors at zero, so a
+        30-bid job and a 300-bid job would rank identically — exactly where ordering matters."""
+        profile = make_profile(min_match_score=0)
+        busy = score_job(make_job(bid_count=30), profile, now=NOW)
+        swamped = score_job(make_job(bid_count=300), profile, now=NOW)
+        assert busy.score > swamped.score
 
     def test_older_post_scores_lower(self):
         fresh = score_job(make_job(posted_at=NOW - dt.timedelta(hours=1)), make_profile(), now=NOW)

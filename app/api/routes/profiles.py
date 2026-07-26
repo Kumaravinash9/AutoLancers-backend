@@ -204,7 +204,7 @@ async def get_profile(
         keywords_include=profile.keywords_include or [],
         keywords_exclude=profile.keywords_exclude or [],
         fixed_project_min=profile.fixed_project_min,
-        max_existing_bids=profile.max_existing_bids,
+        crowded_at_bids=profile.crowded_at_bids,
         min_match_score=profile.min_match_score,
         weight_skills=profile.weight_skills,
         weight_budget=profile.weight_budget,
