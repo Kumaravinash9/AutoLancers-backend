@@ -11,12 +11,19 @@ import asyncio
 import datetime as dt
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Module-wide cache for the skill catalogue (see ``fetch_skill_catalogue``). It's the same static,
+# account-independent list for everyone, so one copy shared across client instances is correct.
+_CATALOGUE_TTL_SECONDS = 24 * 3600
+_catalogue_cache: dict[str, int] | None = None
+_catalogue_fetched_at: float = 0.0
 
 API_BASE = "https://www.freelancer.com/api"
 ACTIVE_PROJECTS_PATH = "/projects/0.1/projects/active/"
@@ -186,12 +193,22 @@ class FreelancerClient:
     async def fetch_skill_catalogue(self) -> dict[str, int]:
         """Return Freelancer's whole skill list as ``{lowercased name: id}``.
 
-        The catalogue is large but effectively static, so callers should cache it rather than
-        refetch every cycle.
+        The catalogue is large (~2000 entries) but effectively static and account-independent, so
+        it's cached module-wide for ``_CATALOGUE_TTL_SECONDS``. Without the cache this 2000-row
+        fetch rode along with every skill resolution; now it's paid once a day at most.
         """
+        global _catalogue_cache, _catalogue_fetched_at
+        now = time.monotonic()
+        if _catalogue_cache is not None and (now - _catalogue_fetched_at) < _CATALOGUE_TTL_SECONDS:
+            return _catalogue_cache
+
         response = await self._get(f"{API_BASE}{JOBS_PATH}", {"limit": 2000})
         entries = response.get("result") or []
-        return {e["name"].lower(): e["id"] for e in entries if e.get("name") and e.get("id")}
+        catalogue = {e["name"].lower(): e["id"] for e in entries if e.get("name") and e.get("id")}
+        if catalogue:  # never cache an empty catalogue — that's a bad response, not a real answer
+            _catalogue_cache = catalogue
+            _catalogue_fetched_at = now
+        return catalogue
 
     async def resolve_skill_ids(self, names: list[str]) -> tuple[list[int], list[str]]:
         """Map profile skill names onto Freelancer skill IDs.
@@ -227,20 +244,27 @@ class FreelancerClient:
         query: str | None = None,
         skill_ids: list[int] | None = None,
         limit: int = 50,
+        offset: int = 0,
+        from_time: int | None = None,
         project_types: tuple[str, ...] = ("fixed", "hourly"),
         max_retries: int = 3,
     ) -> list[JobPosting]:
-        """Fetch active projects, retrying transient failures with exponential backoff.
+        """Fetch one page of active projects, retrying transient failures with exponential backoff.
 
         Pass ``skill_ids`` to filter server-side by skill. Without it this returns whatever was
         posted most recently across the whole marketplace, which for a specialist profile is
         almost entirely noise.
+
+        ``from_time`` (a Unix timestamp) and ``offset`` drive incremental paging: fetch only
+        postings newer than the last watermark, one ``limit``-sized page at a time. Results are
+        newest-first, so walking ``offset`` forward walks backward in time toward that watermark.
 
         Raises on permanent failures (4xx other than 429); the caller decides whether one bad
         cycle should be logged and skipped.
         """
         params: dict[str, Any] = {
             "limit": limit,
+            "offset": offset,
             "full_description": "true",
             "job_details": "true",
             "project_types[]": list(project_types),
@@ -252,6 +276,8 @@ class FreelancerClient:
             params["query"] = query
         if skill_ids:
             params["jobs[]"] = skill_ids
+        if from_time is not None:
+            params["from_time"] = from_time
 
         payload = await self._get(
             f"{API_BASE}{ACTIVE_PROJECTS_PATH}", params, max_retries=max_retries

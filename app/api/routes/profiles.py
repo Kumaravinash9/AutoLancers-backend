@@ -12,6 +12,7 @@ render a name and an avatar would ship every portfolio entry and scoring weight 
 from __future__ import annotations
 
 import datetime as dt
+import random
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,6 +27,8 @@ from app.api.schemas import (
     ProfileIn,
     ProfileOut,
     SelectionIn,
+    SkillNamesIn,
+    SkillsAcceptIn,
 )
 from app.db.models import (
     FreelancerProfile,
@@ -38,7 +41,13 @@ from app.db.models import (
 )
 from app.db.session import get_session
 from app.services.bid_sync import sync_bids
+from app.services.connections import disconnect_connection
 from app.services.pipeline import run_cycle
+from app.services.skill_suggest import (
+    MAX_PROPOSAL_SAMPLES,
+    SkillSuggestError,
+    suggest_skills,
+)
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
 router = APIRouter(tags=["profiles"])
@@ -88,7 +97,10 @@ async def _card(
 ) -> dict:
     connections = (
         await session.scalars(
-            select(PlatformConnection).where(PlatformConnection.user_id == user.id)
+            select(PlatformConnection).where(
+                PlatformConnection.user_id == user.id,
+                PlatformConnection.disconnected_at.is_(None),
+            )
         )
     ).all()
     recs, props, wins = await _counts(session, profile)
@@ -263,6 +275,114 @@ async def update_profile(
     return _out(profile)
 
 
+# --- skill suggestions (LLM proposes, the freelancer confirms) ---
+
+
+@router.post("/profile/skills/suggest", response_model=ProfileOut)
+async def suggest_profile_skills(session: AsyncSession = Depends(get_session)) -> ProfileOut:
+    """Propose skills the freelancer's own evidence supports but their list omits.
+
+    On-demand, not automatic: this spends an LLM call, so it runs when the freelancer asks for it
+    rather than silently on every account refresh. Results land in ``suggested_skills`` and feed
+    nothing until accepted — see ``services.skill_suggest``.
+    """
+    user = await get_or_create_default_user(session)
+    profile = await get_or_create_profile(session, user.id)
+
+    connections = (
+        await session.scalars(
+            select(PlatformConnection).where(
+                PlatformConnection.user_id == user.id,
+                PlatformConnection.disconnected_at.is_(None),
+            )
+        )
+    ).all()
+    proposal_texts = (
+        await session.scalars(
+            select(Proposal.proposal_text)
+            .where(Proposal.freelancer_id == profile.id)
+            .order_by(Proposal.drafted_at.desc())
+            .limit(MAX_PROPOSAL_SAMPLES)
+        )
+    ).all()
+
+    try:
+        suggestions = await suggest_skills(profile, list(connections), list(proposal_texts))
+    except SkillSuggestError as exc:
+        # A user pressed a button; a clear failure beats a silent empty list.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    profile.suggested_skills = [s.as_dict() for s in suggestions]
+    await session.commit()
+    await session.refresh(profile)
+    return _out(profile)
+
+
+@router.post("/profile/skills/accept", response_model=ProfileOut)
+async def accept_profile_skills(
+    payload: SkillsAcceptIn, session: AsyncSession = Depends(get_session)
+) -> ProfileOut:
+    """Confirm suggested skills into the real list. The freelancer may have edited a name or weight
+    first, so the confirmed values — not the proposed ones — are what's stored. An accepted name is
+    also cleared from the pending suggestions."""
+    user = await get_or_create_default_user(session)
+    profile = await get_or_create_profile(session, user.id)
+
+    accepted = [
+        {"name": s.name.strip(), "weight": s.weight} for s in payload.skills if s.name.strip()
+    ]
+
+    # Merge into the existing skills, keeping order and letting an accepted weight update a skill
+    # already listed under the same name. Rebuilt as a fresh list so SQLAlchemy sees the change.
+    by_name: dict[str, dict] = {}
+    order: list[str] = []
+    for existing in profile.skills or []:
+        name = str(existing.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key not in by_name:
+            order.append(key)
+        by_name[key] = {"name": name, "weight": existing.get("weight", 1)}
+    for skill in accepted:
+        key = skill["name"].lower()
+        if key not in by_name:
+            order.append(key)
+        by_name[key] = skill
+    profile.skills = [by_name[key] for key in order]
+
+    accepted_keys = {s["name"].lower() for s in accepted}
+    profile.suggested_skills = [
+        p
+        for p in (profile.suggested_skills or [])
+        if str(p.get("name") or "").strip().lower() not in accepted_keys
+    ]
+
+    await session.commit()
+    await session.refresh(profile)
+    return _out(profile)
+
+
+@router.post("/profile/skills/reject", response_model=ProfileOut)
+async def reject_profile_skills(
+    payload: SkillNamesIn, session: AsyncSession = Depends(get_session)
+) -> ProfileOut:
+    """Dismiss suggestions without accepting them."""
+    user = await get_or_create_default_user(session)
+    profile = await get_or_create_profile(session, user.id)
+
+    drop = {n.strip().lower() for n in payload.names if n.strip()}
+    profile.suggested_skills = [
+        p
+        for p in (profile.suggested_skills or [])
+        if str(p.get("name") or "").strip().lower() not in drop
+    ]
+
+    await session.commit()
+    await session.refresh(profile)
+    return _out(profile)
+
+
 @router.post("/profiles/{profile_id}/sync", response_model=FullSyncOut)
 async def sync_everything(
     profile_id: uuid.UUID, session: AsyncSession = Depends(get_session)
@@ -312,7 +432,10 @@ async def list_connections(session: AsyncSession = Depends(get_session)) -> list
     rows = (
         await session.scalars(
             select(PlatformConnection)
-            .where(PlatformConnection.user_id == user.id)
+            .where(
+                PlatformConnection.user_id == user.id,
+                PlatformConnection.disconnected_at.is_(None),
+            )
             .order_by(PlatformConnection.connected_at)
         )
     ).all()
@@ -357,6 +480,7 @@ async def select_connection(
             select(PlatformConnection).where(
                 PlatformConnection.id == payload.connection_id,
                 PlatformConnection.user_id == user.id,
+                PlatformConnection.disconnected_at.is_(None),
             )
         )
         # 404 rather than 403: whether someone else's connection exists is not ours to confirm.
@@ -386,18 +510,41 @@ async def remove_connection(
 ) -> None:
     """Disconnect a marketplace account.
 
-    Deletes the stored credential only. Projects, recommendations and proposals already gathered
-    through it stay — they are your record of work, not the platform's, and losing your bid
+    A soft delete: the credential is scrubbed immediately, but the row is kept and only hard-deleted
+    later by the background purge — a destructive delete never runs inline against the live database
+    (see ``services.connections``). Projects, recommendations and proposals already gathered through
+    it stay regardless — they are your record of work, not the platform's, and losing your bid
     history because you rotated an account would be its own bug.
     """
     user = await get_or_create_default_user(session)
     connection = await session.scalar(
         select(PlatformConnection).where(
-            PlatformConnection.id == connection_id, PlatformConnection.user_id == user.id
+            PlatformConnection.id == connection_id,
+            PlatformConnection.user_id == user.id,
+            PlatformConnection.disconnected_at.is_(None),
         )
     )
     if connection is None:
         raise HTTPException(status_code=404, detail="Connection not found")
 
-    await session.delete(connection)
+    was_selected = connection.is_selected
+    disconnect_connection(connection)
+
+    # If the account the app was scoped to is the one being removed, move the scope to another
+    # connected account rather than silently dropping to "all accounts". Flush first so the removed
+    # row's cleared selection (and its disconnected_at) lands before we pick a replacement — the
+    # partial unique index allows only one selected row at a time.
+    if was_selected:
+        await session.flush()
+        remaining = (
+            await session.scalars(
+                select(PlatformConnection).where(
+                    PlatformConnection.user_id == user.id,
+                    PlatformConnection.disconnected_at.is_(None),
+                )
+            )
+        ).all()
+        if remaining:
+            random.choice(remaining).is_selected = True
+
     await session.commit()

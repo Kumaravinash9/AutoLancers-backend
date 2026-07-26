@@ -32,6 +32,7 @@ from app.services.bidding import (
     check_availability,
     submit_bid_for_recommendation,
 )
+from app.services.currency import convert
 from app.services.drafting import DraftingError, draft_proposal
 from app.services.pipeline import _to_posting, rescore_all
 from app.services.users import get_or_create_default_user, get_or_create_profile
@@ -39,9 +40,28 @@ from app.services.users import get_or_create_default_user, get_or_create_profile
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
-def _flatten(rec: Recommendation) -> JobOut:
+async def _local_currency(session: AsyncSession, user: User | None = None) -> str | None:
+    """The freelancer's home currency for display, read from the profile — where sync mirrors it
+    from the connected account's country. It's the same currency scoring floors use, so the
+    converted figure and the floor reasoning always agree."""
+    profile = await _profile_for(session, user)
+    return profile.currency
+
+
+def _flatten(rec: Recommendation, local_currency: str | None = None) -> JobOut:
     project = rec.project
     proposal = rec.proposal
+    listed = project.currency
+    # Only fill the local figures when the job is in a different currency and we can convert it;
+    # otherwise leave them null so the UI falls back to the listed budget alone.
+    local_min = local_max = out_local = None
+    if local_currency and listed and local_currency.upper() != listed.upper():
+        converted_min = convert(project.min_budget, listed, local_currency)
+        converted_max = convert(project.max_budget, listed, local_currency)
+        if converted_min is not None or converted_max is not None:
+            out_local = local_currency
+            local_min = round(converted_min) if converted_min is not None else None
+            local_max = round(converted_max) if converted_max is not None else None
     return JobOut(
         id=rec.id,
         platform=project.platform,
@@ -54,6 +74,9 @@ def _flatten(rec: Recommendation) -> JobOut:
         budget_min=project.min_budget,
         budget_max=project.max_budget,
         currency=project.currency,
+        local_currency=out_local,
+        budget_min_local=local_min,
+        budget_max_local=local_max,
         bid_count=project.bid_count,
         posted_at=project.posted_at,
         score=rec.score,
@@ -120,7 +143,8 @@ async def list_jobs(
 
     query = query.limit(limit).offset(offset)
     rows = (await session.scalars(query)).unique().all()
-    return [_flatten(rec) for rec in rows]
+    local = await _local_currency(session)
+    return [_flatten(rec, local) for rec in rows]
 
 
 @router.post("/rescore")
@@ -136,7 +160,9 @@ async def bid_availability(session: AsyncSession = Depends(get_session)) -> BidA
     user = await get_or_create_default_user(session)
     connection = await session.scalar(
         select(PlatformConnection).where(
-            PlatformConnection.user_id == user.id, PlatformConnection.platform == "freelancer"
+            PlatformConnection.user_id == user.id,
+            PlatformConnection.platform == "freelancer",
+            PlatformConnection.disconnected_at.is_(None),
         )
     )
     return check_availability(connection)

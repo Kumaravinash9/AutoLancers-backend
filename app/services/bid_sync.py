@@ -116,7 +116,7 @@ async def _sync_one(
         bidder_id = int(me.get("id") or 0)
         if not bidder_id:
             raise FreelancerAPIError("Could not read own user id")
-        await _store_identity(session, connection, me)
+        await _store_identity(session, profile, connection, me)
         bids = await client.fetch_my_bids(bidder_id)
     except FreelancerAPIError as exc:
         report.error = str(exc)
@@ -331,15 +331,20 @@ def _as_datetime(value: Any):
 
 
 async def _store_identity(
-    session: AsyncSession, connection: PlatformConnection, me: dict[str, Any]
+    session: AsyncSession,
+    profile: FreelancerProfile,
+    connection: PlatformConnection,
+    me: dict[str, Any],
 ) -> None:
     """Save the marketplace's own view of this account: picture, handle, rating and public profile.
 
     Freelancer serves several avatar sizes; prefer the large CDN one, since an image scaled down
     looks better than one scaled up.
 
-    Every field here is overwritten from the marketplace on each sync, deliberately — this is a
-    mirror of what clients see there, not something editable on our side.
+    Every connection field here is overwritten from the marketplace on each sync, deliberately —
+    this is a mirror of what clients see there, not something editable on our side. The freelancer's
+    home country and currency are also mirrored onto ``profile`` (see ``_mirror_home_to_profile``),
+    which is where the rest of the app reads them.
     """
     avatar = (
         me.get("avatar_large_cdn")
@@ -376,6 +381,26 @@ async def _store_identity(
         connection.member_since = dt.datetime.fromtimestamp(registered, tz=dt.UTC)
 
     connection.last_synced_at = utcnow()
+
+    _mirror_home_to_profile(profile, connection)
+
+
+def _mirror_home_to_profile(profile: FreelancerProfile, connection: PlatformConnection) -> None:
+    """Copy the account's home country/currency onto the profile, which is where the rest of the app
+    reads them (scoring floors and the local-currency display).
+
+    Only from the account the app is scoped to — or the first one to arrive, so a fresh profile gets
+    populated. Currency is adopted only while no budget floor has been set: once the freelancer has
+    entered floors, the currency those numbers are stated in is theirs to change, not the sync's to
+    silently reinterpret.
+    """
+    if not connection.is_selected and profile.country:
+        return  # a non-selected account doesn't override an already-populated home
+    if connection.country:
+        profile.country = connection.country
+    # Falsy (0 or an unset None) means no floor entered yet — safe to adopt the account currency.
+    if connection.currency and not profile.rate_min and not profile.fixed_project_min:
+        profile.currency = connection.currency
 
 
 def _as_float(value: Any) -> float | None:

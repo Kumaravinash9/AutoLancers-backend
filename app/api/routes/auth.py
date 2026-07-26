@@ -73,7 +73,9 @@ async def status(
     user = await get_or_create_default_user(session)
     row = await session.scalar(
         select(PlatformConnection).where(
-            PlatformConnection.user_id == user.id, PlatformConnection.platform == platform
+            PlatformConnection.user_id == user.id,
+            PlatformConnection.platform == platform,
+            PlatformConnection.disconnected_at.is_(None),
         )
     )
     if row is None:

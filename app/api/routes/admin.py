@@ -39,7 +39,14 @@ async def overview(session: AsyncSession = Depends(get_session)) -> AdminOvervie
     active_users = (
         await session.scalar(select(func.count(User.id)).where(User.is_active.is_(True))) or 0
     )
-    connected = await session.scalar(select(func.count(PlatformConnection.id))) or 0
+    connected = (
+        await session.scalar(
+            select(func.count(PlatformConnection.id)).where(
+                PlatformConnection.disconnected_at.is_(None)
+            )
+        )
+        or 0
+    )
 
     total_jobs = await session.scalar(select(func.count(Recommendation.id))) or 0
     matched = (
@@ -135,7 +142,10 @@ async def users(session: AsyncSession = Depends(get_session)) -> list[AdminUserO
             or 0
         )
         token = await session.scalar(
-            select(PlatformConnection).where(PlatformConnection.user_id == user.id)
+            select(PlatformConnection).where(
+                PlatformConnection.user_id == user.id,
+                PlatformConnection.disconnected_at.is_(None),
+            )
         )
         out.append(
             AdminUserOut(
