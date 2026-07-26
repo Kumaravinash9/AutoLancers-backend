@@ -375,6 +375,14 @@ class Proposal(Base):
         ForeignKey("recommendations.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Which marketplace account placed it. Nullable because a draft has no account yet, and
+    # SET NULL on delete so disconnecting an account doesn't take its bid history with it.
+    connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("platform_connections.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     proposal_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     bid_amount: Mapped[float | None] = mapped_column(Float, nullable=True)

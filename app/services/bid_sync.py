@@ -157,7 +157,7 @@ async def _sync_one(
 
     for bid in bids:
         try:
-            outcome = await _apply(session, profile, bid, known)
+            outcome = await _apply(session, profile, bid, known, connection)
         except Exception:
             logger.exception("Could not sync bid %s", bid.get("id"))
             continue
@@ -180,6 +180,7 @@ async def _apply(
     profile: FreelancerProfile,
     bid: dict[str, Any],
     known: dict[str, Project],
+    connection: PlatformConnection,
 ) -> _Applied:
     external_bid_id = str(bid.get("id") or "")
     project = known.get(str(bid.get("project_id")))
@@ -222,6 +223,7 @@ async def _apply(
         result.outcome_changed = True
     proposal.status = status
 
+    proposal.connection_id = connection.id
     proposal.external_bid_id = external_bid_id
     proposal.bid_amount = _as_float(bid.get("amount")) or proposal.bid_amount
     proposal.estimated_days = _as_int(bid.get("period")) or proposal.estimated_days

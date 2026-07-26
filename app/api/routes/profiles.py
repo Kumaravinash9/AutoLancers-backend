@@ -290,21 +290,42 @@ async def list_connections(session: AsyncSession = Depends(get_session)) -> list
             .order_by(PlatformConnection.connected_at)
         )
     ).all()
-    return [
-        ConnectionOut(
-            id=c.id,
-            platform=c.platform,
-            platform_username=c.platform_username,
-            scope=c.scope,
-            rating=c.rating,
-            total_reviews=c.total_reviews,
-            avatar_url=c.avatar_url,
-            status=c.status,
-            connected_at=c.connected_at,
-            last_synced_at=c.last_synced_at,
+    out: list[ConnectionOut] = []
+    for c in rows:
+        placed = (
+            await session.scalar(
+                select(func.count(Proposal.id)).where(Proposal.connection_id == c.id)
+            )
+            or 0
         )
-        for c in rows
-    ]
+        won = (
+            await session.scalar(
+                select(func.count(Proposal.id)).where(
+                    Proposal.connection_id == c.id,
+                    Proposal.status == ProposalStatus.ACCEPTED,
+                )
+            )
+            or 0
+        )
+        out.append(
+            ConnectionOut(
+                id=c.id,
+                proposals=placed,
+                wins=won,
+                platform=c.platform,
+                platform_username=c.platform_username,
+                scope=c.scope,
+                rating=c.rating,
+                total_reviews=c.total_reviews,
+                # Freelancer serves a grey placeholder for accounts with no picture; treat it as
+                # no picture so the UI can fall back to initials instead.
+                avatar_url=None if (c.avatar_url or "").endswith("unknown.png") else c.avatar_url,
+                status=c.status,
+                connected_at=c.connected_at,
+                last_synced_at=c.last_synced_at,
+            )
+        )
+    return out
 
 
 @router.delete("/connections/{connection_id}", status_code=204)

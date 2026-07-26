@@ -267,10 +267,16 @@ class ProposalStats(BaseModel):
 
 
 class ConnectionOut(BaseModel):
-    """One marketplace account linked to this user."""
+    """One marketplace account linked to this user.
+
+    Counts are per account, not per user: with two accounts connected, a shared total would say
+    nothing about which one is actually winning work.
+    """
 
     id: uuid.UUID
     platform: str
+    proposals: int = 0
+    wins: int = 0
     platform_username: str | None
     scope: str | None
     rating: float | None
