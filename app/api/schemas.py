@@ -274,6 +274,7 @@ class ConnectionOut(BaseModel):
     scope: str | None
     rating: float | None
     total_reviews: int | None
+    avatar_url: str | None
     status: str
     connected_at: dt.datetime | None
     last_synced_at: dt.datetime | None

@@ -172,6 +172,9 @@ class PlatformConnection(Base):
 
     rating: Mapped[float | None] = mapped_column(Float, nullable=True)
     total_reviews: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The avatar as the marketplace serves it. Stored per connection rather than per user because
+    # the same person can present differently on Freelancer and Upwork.
+    avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     connected_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     token_expires_at: Mapped[dt.datetime | None] = mapped_column(

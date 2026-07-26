@@ -97,7 +97,10 @@ async def _card(
         "id": profile.id,
         "display_name": profile.display_name or user.name or user.email,
         "headline": profile.headline,
-        "profile_image": user.profile_image,
+        # Prefer the marketplace avatar; fall back to anything set on the account.
+        "profile_image": next(
+            (c.avatar_url for c in connections if c.avatar_url), user.profile_image
+        ),
         "initials": _initials(profile.display_name or user.name or "", user.email),
         # Cards show a handful; the rest are counted rather than listed.
         "skills": skills[:8],
@@ -178,6 +181,7 @@ async def get_profile(
                 scope=c.scope,
                 rating=c.rating,
                 total_reviews=c.total_reviews,
+                avatar_url=c.avatar_url,
                 status=c.status,
                 connected_at=c.connected_at,
                 last_synced_at=c.last_synced_at,

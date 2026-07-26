@@ -26,6 +26,7 @@ from app.connectors.freelancer import FreelancerAPIError, FreelancerClient, JobP
 from app.db.models import (
     DiscoveryMethod,
     FreelancerProfile,
+    PlatformConnection,
     Project,
     Proposal,
     ProposalStatus,
@@ -79,7 +80,11 @@ async def sync_bids(
     client = FreelancerClient(access_token=token)
 
     try:
-        bidder_id = await client.fetch_self_id()
+        me = await client.fetch_self()
+        bidder_id = int(me.get("id") or 0)
+        if not bidder_id:
+            raise FreelancerAPIError("Could not read own user id")
+        await _store_identity(session, user_id, me)
         bids = await client.fetch_my_bids(bidder_id)
     except FreelancerAPIError as exc:
         report.error = str(exc)
@@ -294,3 +299,41 @@ def _as_datetime(value: Any):
     if isinstance(value, int | float):
         return dt.datetime.fromtimestamp(value, tz=dt.UTC)
     return None
+
+
+async def _store_identity(
+    session: AsyncSession, user_id: uuid.UUID, me: dict[str, Any]
+) -> None:
+    """Save the marketplace's own picture, handle and rating onto the connection.
+
+    Freelancer serves several avatar sizes; prefer the large CDN one, since an image scaled down
+    looks better than one scaled up.
+    """
+    connection = await session.scalar(
+        select(PlatformConnection).where(
+            PlatformConnection.user_id == user_id, PlatformConnection.platform == "freelancer"
+        )
+    )
+    if connection is None:
+        return
+
+    avatar = (
+        me.get("avatar_large_cdn")
+        or me.get("avatar_cdn")
+        or me.get("avatar_large")
+        or me.get("avatar")
+    )
+    if avatar:
+        # The API returns protocol-relative URLs in places; a bare //host path won't load.
+        connection.avatar_url = f"https:{avatar}" if avatar.startswith("//") else avatar
+
+    connection.platform_user_id = str(me.get("id") or "") or connection.platform_user_id
+    connection.platform_username = me.get("username") or connection.platform_username
+
+    reputation = (me.get("reputation") or {}).get("entire_history") or {}
+    if reputation.get("overall") is not None:
+        connection.rating = float(reputation["overall"])
+    if reputation.get("reviews") is not None:
+        connection.total_reviews = int(reputation["reviews"])
+
+    connection.last_synced_at = utcnow()

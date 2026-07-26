@@ -74,6 +74,18 @@ class FreelancerClient:
     def _headers(self) -> dict[str, str]:
         return {AUTH_HEADER: self.access_token} if self.access_token else {}
 
+    async def fetch_self(self) -> dict[str, Any]:
+        """The authenticated user's own record: id, username, avatar and reputation.
+
+        ``avatar=true`` and ``reputation=true`` are opt-in flags; without them the response omits
+        those blocks entirely rather than returning nulls.
+        """
+        payload = await self._get(
+            f"{API_BASE}{SELF_PATH}",
+            {"avatar": "true", "reputation": "true", "display_info": "true"},
+        )
+        return (payload.get("result") or {}) or {}
+
     async def fetch_self_id(self) -> int:
         """The authenticated user's own id, required as ``bidder_id`` when placing a bid.
 
