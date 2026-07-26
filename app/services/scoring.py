@@ -18,6 +18,8 @@ from typing import Any
 
 from app.connectors.freelancer import JobPosting
 from app.db.models import FreelancerProfile, utcnow
+from app.services.currency import convert
+from app.services.matching import SkillMatch
 
 # Anything older than this scores zero on recency.
 RECENCY_HORIZON_HOURS = 48.0
@@ -36,8 +38,14 @@ class ScoreResult:
 
 
 def score_job(
-    job: JobPosting, profile: FreelancerProfile, now: dt.datetime | None = None
+    job: JobPosting,
+    profile: FreelancerProfile,
+    now: dt.datetime | None = None,
+    skill_match: SkillMatch | None = None,
 ) -> ScoreResult:
+    """Score one job. ``skill_match`` is an optional precomputed semantic fit (see
+    ``services.matching``); when given, it replaces the substring skill match. It's computed in the
+    async pipeline — only for new/changed postings — and threaded in here so scoring stays sync."""
     now = now or utcnow()
     haystack = _haystack(job)
 
@@ -61,7 +69,7 @@ def score_job(
         )
 
     earned = 0.0
-    earned += _score_skills(job, profile, haystack, weights["skills"], reasons)
+    earned += _score_skills(job, profile, haystack, weights["skills"], reasons, skill_match)
     earned += _score_budget(job, profile, weights["budget"], reasons)
     earned += _score_competition(job, profile, weights["competition"], reasons)
     earned += _score_recency(job, now, weights["recency"], reasons)
@@ -82,6 +90,16 @@ def score_job(
 # --- hard filters -----------------------------------------------------------------
 
 
+def hard_reject_reason(job: JobPosting, profile: FreelancerProfile) -> str | None:
+    """The reason a hard filter rejects ``job`` outright, or ``None`` if it clears them.
+
+    Exposed so callers can distinguish a hard rejection (excluded/required keyword or budget floor
+    — final regardless of skill fit, since these run before skills scoring) from a merely low
+    score. Used to decide whether an expensive semantic skill match is worth running at all.
+    """
+    return _hard_filter(job, profile, _haystack(job))
+
+
 def _hard_filter(job: JobPosting, profile: FreelancerProfile, haystack: str) -> str | None:
     for term in profile.keywords_exclude or []:
         if term and _contains_term(haystack, term):
@@ -92,12 +110,16 @@ def _hard_filter(job: JobPosting, profile: FreelancerProfile, haystack: str) -> 
         return f"No required keyword present (need one of: {', '.join(includes)})"
 
     floor = _budget_floor(job, profile)
-    if floor is not None and job.budget_max is not None and job.budget_max < floor:
-        currency = job.currency or profile.currency
-        return (
-            f"Budget tops out at {job.budget_max:.0f} {currency}, "
-            f"below your floor of {floor:.0f}"
-        )
+    if floor is not None and job.budget_max is not None:
+        budget = _budget_in_floor_currency(job, profile)
+        # If the currencies differ and there's no rate, ``budget`` is None: skip the floor rather
+        # than compare across currencies — a garbage comparison is how a ₹12,500 job used to read
+        # as clearing a $500 floor.
+        if budget is not None and budget < floor:
+            return (
+                f"Budget tops out at {job.budget_max:.0f} {job.currency or profile.currency}, "
+                f"below your floor of {floor:.0f} {profile.currency}"
+            )
 
     return None
 
@@ -110,6 +132,20 @@ def _budget_floor(job: JobPosting, profile: FreelancerProfile) -> float | None:
     return None  # unknown type — don't guess which floor applies
 
 
+def _budget_in_floor_currency(job: JobPosting, profile: FreelancerProfile) -> float | None:
+    """``job.budget_max`` expressed in the profile's currency, which floors are stated in.
+
+    ``None`` when the currencies differ and no conversion rate is available — the caller treats
+    that as "can't tell", not as zero. A job with no stated currency is assumed to already be in
+    the profile's currency (the same assumption the rest of scoring makes)."""
+    if job.budget_max is None:
+        return None
+    job_currency = job.currency or profile.currency
+    if job_currency == profile.currency:
+        return job.budget_max
+    return convert(job.budget_max, job_currency, profile.currency)
+
+
 # --- components -------------------------------------------------------------------
 
 
@@ -119,10 +155,28 @@ def _score_skills(
     haystack: str,
     weight: float,
     reasons: list[dict[str, Any]],
+    skill_match: SkillMatch | None = None,
 ) -> float:
     skills = [s for s in (profile.skills or []) if s.get("name")]
     if not skills or weight <= 0:
         return 0.0
+
+    # A precomputed semantic fit (see ``services.matching``) supersedes substring matching: it
+    # already reasoned about equivalent and adjacent skills the literal match can't see. Its 0-1
+    # score is the fraction of the skills weight earned.
+    if skill_match is not None:
+        earned = skill_match.score * weight
+        detail = skill_match.reason or (
+            ", ".join(skill_match.matched) if skill_match.matched else "Semantic fit"
+        )
+        reasons.append(
+            {
+                "label": "Skills matched (semantic)",
+                "detail": detail,
+                "points": round(earned, 1),
+            }
+        )
+        return earned
 
     # Score against what a single job could plausibly ask for, not against your whole skill list.
     # Normalising by the total would punish having broad skills: a Python/FastAPI/AI job would
@@ -181,13 +235,26 @@ def _score_budget(
         )
         return earned
 
-    ratio = job.budget_max / floor
+    budget = _budget_in_floor_currency(job, profile)
+    if budget is None:
+        # Currencies differ and there's no rate — score neutral rather than divide across them.
+        earned = weight * 0.5
+        reasons.append(
+            {
+                "label": "Budget currency unknown",
+                "detail": f"Listed up to {job.budget_max:.0f} {currency}; can't compare to your floor",
+                "points": round(earned, 1),
+            }
+        )
+        return earned
+
+    ratio = budget / floor
     fraction = 1.0 if ratio >= 2 else 0.7 if ratio >= 1 else 0.0
     earned = weight * fraction
     reasons.append(
         {
             "label": "Budget fit",
-            "detail": f"Up to {job.budget_max:.0f} {currency} against your floor of {floor:.0f}",
+            "detail": f"Up to {job.budget_max:.0f} {currency} against your floor of {floor:.0f} {profile.currency}",
             "points": round(earned, 1),
         }
     )

@@ -28,6 +28,12 @@ class JobOut(BaseModel):
     budget_min: float | None
     budget_max: float | None
     currency: str | None
+    # The same budget converted into the freelancer's local currency (from their account's country)
+    # for an at-a-glance read, alongside the listed figures above. Null when the job is already in
+    # the local currency or no conversion rate is available — the UI then shows only the listed one.
+    local_currency: str | None = None
+    budget_min_local: float | None = None
+    budget_max_local: float | None = None
     bid_count: int | None
     posted_at: dt.datetime | None
     score: float
@@ -88,6 +94,9 @@ class ProfileOut(BaseModel):
     fixed_project_min: float
     rate_min: float
     currency: str
+    # Mirrored from the connected account during sync; read-only here. Display uses it to label the
+    # freelancer's home currency alongside each job's listed one.
+    country: str | None = None
     crowded_at_bids: int
     min_match_score: float
     weight_skills: float
@@ -95,6 +104,10 @@ class ProfileOut(BaseModel):
     weight_competition: float
     weight_recency: float
     proposal_notes: str
+
+    # LLM-proposed skills awaiting the freelancer's decision (see services.skill_suggest). Ride the
+    # same shape the edit form already reads so the suggestions render without a second fetch.
+    suggested_skills: list[dict[str, Any]] = []
 
     # When the board was last recalculated against the marketplace, and when the profile itself
     # was last edited. A profile that drifts out of date is the quiet failure mode here: the
@@ -122,6 +135,19 @@ class ProfileIn(BaseModel):
     weight_competition: float = 10.0
     weight_recency: float = 10.0
     proposal_notes: str = ""
+
+
+class SkillsAcceptIn(BaseModel):
+    """Skills the freelancer confirmed from the suggestions — editable, so name and weight may
+    differ from what was proposed. Each is added to the profile's real ``skills`` at full trust."""
+
+    skills: list[SkillIn] = Field(default_factory=list)
+
+
+class SkillNamesIn(BaseModel):
+    """Suggestion names to drop, unaccepted."""
+
+    names: list[str] = Field(default_factory=list)
 
 
 class AuthStatus(BaseModel):

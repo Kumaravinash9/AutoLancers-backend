@@ -8,6 +8,7 @@ import pytest
 
 from app.connectors.freelancer import JobPosting, normalize_project
 from app.db.models import FreelancerProfile
+from app.services.matching import SkillMatch
 from app.services.scoring import score_job
 
 NOW = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.UTC)
@@ -206,6 +207,87 @@ class TestScoring:
         result = score_job(make_job(), profile, now=NOW)
         assert result.rejected
         assert "weights are zero" in result.rejection_reason
+
+
+class TestSemanticSkillMatch:
+    """When a precomputed :class:`SkillMatch` is supplied, it replaces substring matching."""
+
+    def test_semantic_match_supersedes_substring(self):
+        """A job whose words never mention the skill can still earn full skill points."""
+        # "Expo cross-platform app" — no literal "react native" anywhere, so substring scores zero.
+        profile = make_profile(skills=[{"name": "react native", "weight": 5}])
+        job = make_job(
+            title="Expo cross-platform app",
+            description="Build a cross-platform mobile app with Expo.",
+            skills_listed=["Expo"],
+            budget_max=1500.0,
+        )
+
+        substring = score_job(job, profile, now=NOW)
+        assert any(r["label"] == "No skill match" for r in substring.reasons)
+
+        semantic = score_job(
+            job,
+            profile,
+            now=NOW,
+            skill_match=SkillMatch(score=1.0, matched=["react native"], reason="Expo is RN"),
+        )
+        points = next(
+            r["points"] for r in semantic.reasons if r["label"] == "Skills matched (semantic)"
+        )
+        assert points == pytest.approx(profile.weight_skills)
+        assert semantic.score > substring.score
+
+    def test_semantic_score_is_a_fraction_of_the_skills_weight(self):
+        profile = make_profile()
+        result = score_job(
+            make_job(), profile, now=NOW, skill_match=SkillMatch(score=0.5, reason="partial fit")
+        )
+        points = next(
+            r["points"] for r in result.reasons if r["label"] == "Skills matched (semantic)"
+        )
+        assert points == pytest.approx(profile.weight_skills * 0.5)
+
+    def test_reason_falls_back_when_the_model_gives_none(self):
+        result = score_job(
+            make_job(), make_profile(), now=NOW, skill_match=SkillMatch(score=0.8, matched=["react"])
+        )
+        detail = next(
+            r["detail"] for r in result.reasons if r["label"] == "Skills matched (semantic)"
+        )
+        assert detail == "react"
+
+    def test_no_skills_ignores_the_match(self):
+        """With no skills the component is zero regardless of a supplied match — nothing to credit."""
+        profile = make_profile(skills=[])
+        result = score_job(
+            make_job(), profile, now=NOW, skill_match=SkillMatch(score=1.0, reason="x")
+        )
+        assert not any("semantic" in r["label"] for r in result.reasons)
+
+
+class TestCurrencyAwareBudget:
+    """The floor and the budget score compare across currencies, not raw numbers."""
+
+    def test_low_budget_in_another_currency_is_rejected(self):
+        # ~12,500 INR is ~150 USD — under the 500 USD floor. The raw-number bug let this pass
+        # because 12500 > 500.
+        job = make_job(currency="INR", budget_min=1_500, budget_max=12_500)
+        result = score_job(job, make_profile(), now=NOW)
+        assert result.rejected
+        assert "below your floor" in result.rejection_reason
+
+    def test_adequate_budget_in_another_currency_passes(self):
+        # ~1,000,000 INR is ~12,000 USD, comfortably above the 500 USD floor.
+        job = make_job(currency="INR", budget_min=500_000, budget_max=1_000_000)
+        result = score_job(job, make_profile(min_match_score=0), now=NOW)
+        assert not result.rejected
+
+    def test_unknown_currency_skips_the_floor_rather_than_guessing(self):
+        job = make_job(currency="ZZZ", budget_min=1, budget_max=1)
+        result = score_job(job, make_profile(min_match_score=0), now=NOW)
+        assert not result.rejected  # can't convert → don't reject on budget
+        assert any(r["label"] == "Budget currency unknown" for r in result.reasons)
 
 
 class TestTermMatching:

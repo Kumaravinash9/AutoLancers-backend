@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.freelancer_oauth import OAuthError, get_valid_access_token
+from app.config import get_settings
 from app.connectors.freelancer import FreelancerAPIError, FreelancerClient, JobPosting
 from app.db.models import (
     CycleRun,
@@ -36,7 +37,9 @@ from app.db.models import (
     utcnow,
 )
 from app.services.drafting import DraftingError, draft_proposal
-from app.services.scoring import score_job
+from app.services.matching import MatchingError, SkillMatch, match_skills
+from app.services.scoring import hard_reject_reason, score_job
+from app.services.skill_expansion import SkillExpansionError, expand_skill_terms
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,32 @@ STALE_AFTER = dt.timedelta(hours=24)
 
 # Cap drafts per cycle so a backlog can't produce a burst of API spend in one go.
 MAX_DRAFTS_PER_CYCLE = 5
+
+# Incremental discovery. Each cycle pages newest-first from the last watermark forward, so a busy
+# board can't push new postings past a single page of "newest".
+DISCOVERY_PAGE_SIZE = 100
+DISCOVERY_MAX_PAGES = 5  # hard ceiling on projects pulled per cycle (page_size * pages)
+# Re-include the boundary second so nothing slips between cycles; the upsert in ``_ingest`` makes
+# the handful of re-seen rows idempotent.
+WATERMARK_OVERLAP = dt.timedelta(seconds=60)
+
+
+@dataclass
+class _MatchBudget:
+    """Caps how many *new* semantic matches one cycle pays the LLM for, so widening the skill
+    filter can't turn discovery volume straight into spend. Cache hits and hard-rejected jobs never
+    draw from it; a job denied a slot falls back to substring this cycle and gets its match on a
+    later one (the cache persists once computed). ``remaining is None`` means no ceiling."""
+
+    remaining: int | None
+
+    def take(self) -> bool:
+        if self.remaining is None:
+            return True
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
 
 
 @dataclass
@@ -85,36 +114,45 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
 
     client = FreelancerClient(access_token=token)
 
-    # Filter server-side by the profile's skills. Without this the search returns whatever was
-    # posted most recently across the whole marketplace, which for a specialist profile is
-    # overwhelmingly irrelevant.
-    skill_ids: list[int] = []
-    try:
-        names = [s["name"] for s in (profile.skills or []) if s.get("name")]
-        if names:
-            skill_ids, unmatched = await client.resolve_skill_ids(names)
-            report.unmatched_skills = unmatched
-            if unmatched:
-                logger.info(
-                    "Profile skills with no Freelancer equivalent (ignored in search): %s",
-                    ", ".join(unmatched),
-                )
-    except FreelancerAPIError as exc:
-        logger.warning("Could not resolve skill filters, searching unfiltered: %s", exc)
+    # Filter server-side by the profile's skills, broadened into the marketplace's tag vocabulary
+    # so generically-tagged jobs surface too. Cached on the profile and recomputed only when the
+    # confirmed skills change (see ``_resolve_search_skill_ids``); an empty result searches
+    # unfiltered rather than not at all.
+    skill_ids = await _resolve_search_skill_ids(client, profile, report)
 
+    # First run has no watermark: bootstrap from the newest page instead of backfilling the whole
+    # board. After that, page forward from where the last cycle stopped, bounded by the cap.
+    max_pages = DISCOVERY_MAX_PAGES if profile.last_project_submitted_at else 1
     try:
-        postings = await client.search_active_projects(skill_ids=skill_ids or None)
+        postings, truncated = await _fetch_new_postings(
+            client, skill_ids, profile.last_project_submitted_at, max_pages
+        )
     except FreelancerAPIError as exc:
         report.error = str(exc)
         logger.warning("Skipping cycle: %s", exc)
         await _record(session, user.id, report, started, trigger)
         return report
 
+    if truncated:
+        logger.warning(
+            "Discovery hit the %d-page cap (%d projects); newer postings may have been skipped "
+            "this cycle — consider a shorter poll interval or a higher cap.",
+            max_pages,
+            max_pages * DISCOVERY_PAGE_SIZE,
+        )
+
     report.fetched = len(postings)
+
+    settings = get_settings()
+    match_budget = _MatchBudget(
+        remaining=None
+        if settings.skill_match_max_per_cycle <= 0
+        else settings.skill_match_max_per_cycle
+    )
 
     for posting in postings:
         try:
-            created, rejected, changed = await _ingest(session, profile, posting)
+            created, rejected, changed = await _ingest(session, profile, posting, match_budget)
         except Exception:  # one malformed posting must not end the cycle
             logger.exception("Failed to store posting %s", posting.external_id)
             continue
@@ -122,6 +160,14 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
         report.updated += int(changed)
         report.unchanged += int(not created and not changed)
         report.rejected += int(rejected)
+
+    # Advance the watermark to the newest posting we pulled, so the next cycle starts just past it.
+    newest = max((p.posted_at for p in postings if p.posted_at is not None), default=None)
+    if newest is not None and (
+        profile.last_project_submitted_at is None
+        or newest > profile.last_project_submitted_at
+    ):
+        profile.last_project_submitted_at = newest
 
     profile.last_synced_at = utcnow()
     await session.commit()
@@ -142,6 +188,103 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
     return report
 
 
+async def _fetch_new_postings(
+    client: FreelancerClient,
+    skill_ids: list[int],
+    since: dt.datetime | None,
+    max_pages: int,
+) -> tuple[list[JobPosting], bool]:
+    """Page active projects newest-first from ``since`` (the last watermark) forward.
+
+    Returns ``(postings, truncated)``. ``truncated`` is True when the page cap was hit before the
+    board ran out — the honest signal that postings are arriving faster than one cycle can drain,
+    so some new ones were skipped this cycle. On the first run (``since`` is None) the caller keeps
+    ``max_pages`` small so this bootstraps from the newest page rather than backfilling the board.
+    """
+    from_time = int((since - WATERMARK_OVERLAP).timestamp()) if since is not None else None
+
+    collected: list[JobPosting] = []
+    for page in range(max_pages):
+        batch = await client.search_active_projects(
+            skill_ids=skill_ids or None,
+            from_time=from_time,
+            offset=page * DISCOVERY_PAGE_SIZE,
+            limit=DISCOVERY_PAGE_SIZE,
+        )
+        collected.extend(batch)
+        if len(batch) < DISCOVERY_PAGE_SIZE:
+            return collected, False  # a short page means the board ran out — we caught up
+    return collected, True  # every page was full — more likely remain than not
+
+
+def _search_skill_ids_key(names: list[str], expansion_enabled: bool) -> str:
+    """Cache key for the resolved discovery IDs: the confirmed skills plus whether expansion is on.
+    It moves when either changes, so the IDs recompute exactly then rather than every cycle."""
+    payload = json.dumps([sorted(names), expansion_enabled], sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+async def _resolve_search_skill_ids(
+    client: FreelancerClient, profile: FreelancerProfile, report: CycleReport
+) -> list[int]:
+    """Resolve the profile's confirmed skills — widened for discovery — to Freelancer skill IDs.
+
+    Cached on the profile: the LLM expansion and the catalogue lookup run only when the confirmed
+    skills change, not every cycle. On any failure it keeps the last good IDs rather than dropping
+    the filter, so a transient blip can't turn a specialist search into the whole marketplace.
+    """
+    names = [s["name"] for s in (profile.skills or []) if s.get("name")]
+    key = _search_skill_ids_key(names, get_settings().skill_expansion_enabled)
+
+    if profile.search_skill_ids_key == key:
+        return list(profile.search_skill_ids or [])  # inputs unchanged — reuse the cached IDs
+
+    if not names:
+        profile.search_skill_ids = []
+        profile.search_skill_ids_key = key
+        return []
+
+    try:
+        direct_ids, unmatched = await client.resolve_skill_ids(names)
+    except FreelancerAPIError as exc:
+        logger.warning("Could not resolve skill filters, keeping the last set: %s", exc)
+        return list(profile.search_skill_ids or [])
+
+    report.unmatched_skills = unmatched
+    if unmatched:
+        logger.info(
+            "Profile skills with no Freelancer equivalent (ignored in search): %s",
+            ", ".join(unmatched),
+        )
+
+    ids = list(direct_ids)
+    expansion_complete = True
+    try:
+        extra_terms = await expand_skill_terms(names)
+    except SkillExpansionError as exc:
+        expansion_complete = False
+        extra_terms = []
+        logger.warning("Skill expansion failed, searching on listed skills only: %s", exc)
+
+    if extra_terms:
+        try:
+            extra_ids, _ = await client.resolve_skill_ids(extra_terms)
+        except FreelancerAPIError as exc:
+            expansion_complete = False
+            extra_ids = []
+            logger.warning("Could not resolve expanded skills: %s", exc)
+        for skill_id in extra_ids:
+            if skill_id not in ids:
+                ids.append(skill_id)
+
+    profile.search_skill_ids = ids
+    # Pin the key only when the full set resolved. A partial (expansion-failed) result leaves the
+    # key stale so the next cycle retries the expansion rather than sticking as direct-only.
+    if expansion_complete:
+        profile.search_skill_ids_key = key
+    return ids
+
+
 def _fingerprint(posting: JobPosting) -> str:
     """Hash of the fields a freelancer would care about changing."""
     payload = json.dumps(
@@ -159,8 +302,54 @@ def _fingerprint(posting: JobPosting) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _skill_match_key(profile: FreelancerProfile, content_hash: str) -> str:
+    """Cache key for a semantic skill match: the profile's skills plus the posting's content.
+
+    Reuses the posting's ``content_hash`` for the job side, so the match invalidates on the same
+    field changes ingest already tracks. Any change to the freelancer's skill *names* moves the key
+    too; skill weights don't, since the LLM only judges the names.
+    """
+    names = sorted(s["name"] for s in (profile.skills or []) if s.get("name"))
+    payload = json.dumps([names, content_hash], sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _worth_matching(posting: JobPosting, profile: FreelancerProfile) -> bool:
+    """Whether a semantic match could change this job's fate — the test for spending the LLM.
+
+    Skip it when the feature is off, the profile lists no skills, or a hard filter already rejects
+    the job: hard filters run before skills in scoring and reject regardless of fit, so a match
+    would be wasted. Jobs that merely score low still qualify — lifting a low skills score over the
+    threshold is exactly what the semantic match is for, so those must not be gated out here.
+    """
+    if not get_settings().skill_match_enabled:
+        return False
+    if not any(s.get("name") for s in (profile.skills or [])):
+        return False
+    return hard_reject_reason(posting, profile) is None
+
+
+def _cached_skill_match(rec: Recommendation, key: str) -> SkillMatch | None:
+    """The stored match if it was computed for this exact key, else ``None`` to recompute."""
+    if rec.skill_match_key == key and rec.skill_match_score is not None:
+        return SkillMatch(score=rec.skill_match_score, reason=rec.skill_match_reason or "")
+    return None
+
+
+def _store_skill_match(rec: Recommendation, key: str, match: SkillMatch | None) -> None:
+    """Cache a freshly computed match. A ``None`` match (feature off, no key, or a failed call)
+    clears the cache and leaves the key set, so an unchanged posting isn't retried every cycle —
+    it retries once its content or the profile's skills move."""
+    rec.skill_match_key = key
+    rec.skill_match_score = match.score if match else None
+    rec.skill_match_reason = match.reason if match else None
+
+
 async def _ingest(
-    session: AsyncSession, profile: FreelancerProfile, posting: JobPosting
+    session: AsyncSession,
+    profile: FreelancerProfile,
+    posting: JobPosting,
+    match_budget: _MatchBudget,
 ) -> tuple[bool, bool, bool]:
     """Upsert the project, then this profile's recommendation for it.
 
@@ -203,8 +392,6 @@ async def _ingest(
     # The recommendation's FK needs the project's id, which only exists after a flush.
     await session.flush()
 
-    result = score_job(posting, profile)
-
     recommendation = await session.scalar(
         select(Recommendation).where(
             Recommendation.freelancer_id == profile.id,
@@ -215,6 +402,25 @@ async def _ingest(
     if recommendation is None:
         recommendation = Recommendation(freelancer_id=profile.id, project_id=project.id)
         session.add(recommendation)
+
+    # Semantic matching is the one paid step here. Three things keep its cost bounded as discovery
+    # widens: the cache (unchanged pair → reuse, free), the hard-filter gate (skip jobs a keyword
+    # or budget filter rejects regardless of skill fit), and the per-cycle budget (cap fresh
+    # matches so volume can't turn into unbounded spend). A cache hit bypasses the latter two.
+    match_key = _skill_match_key(profile, incoming_hash)
+    skill_match = _cached_skill_match(recommendation, match_key)
+    if skill_match is None and _worth_matching(posting, profile) and match_budget.take():
+        try:
+            skill_match = await match_skills(posting, profile)
+        except MatchingError as exc:
+            # A failed call must not stop ingest — scoring falls back to substring matching.
+            logger.warning("Skill match failed for %s, using substring: %s", posting.external_id, exc)
+            skill_match = None
+        # Only cache a genuine verdict. A budget-deferred job never reaches here, so it stays a
+        # cache miss and gets another turn on a later cycle.
+        _store_skill_match(recommendation, match_key, skill_match)
+
+    result = score_job(posting, profile, skill_match=skill_match)
 
     recommendation.score = result.score
     recommendation.reasons = result.reasons
@@ -313,7 +519,14 @@ async def rescore_all(session: AsyncSession, profile: FreelancerProfile) -> int:
     )
 
     for rec in rows:
-        result = score_job(_to_posting(rec.project), profile)
+        # Rescore is sync and never calls the LLM: reuse the cached match if the profile's skills
+        # and the posting are unchanged (a weight-only tweak keeps it), else fall back to substring.
+        # A skills change invalidates the key; the next poll cycle recomputes the semantic match.
+        skill_match = None
+        if rec.project.content_hash:
+            key = _skill_match_key(profile, rec.project.content_hash)
+            skill_match = _cached_skill_match(rec, key)
+        result = score_job(_to_posting(rec.project), profile, skill_match=skill_match)
         rec.score = result.score
         rec.reasons = result.reasons
         rec.is_hard_rejected = result.rejected

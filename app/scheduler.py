@@ -13,6 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.config import get_settings
 from app.db.session import SessionLocal
+from app.services.connections import purge_disconnected_connections
 from app.services.pipeline import prune_stale_jobs, run_cycle
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,18 @@ async def _prune() -> None:
         logger.exception("Prune failed")
 
 
+async def _purge_connections() -> None:
+    # The one place a connection row is actually deleted — batched, off the request path, and only
+    # for accounts disconnected long enough that no reconnect or undo is expected.
+    try:
+        async with SessionLocal() as session:
+            removed = await purge_disconnected_connections(session)
+            if removed:
+                logger.info("Purged %d long-disconnected connections", removed)
+    except Exception:
+        logger.exception("Connection purge failed")
+
+
 def start_scheduler() -> AsyncIOScheduler | None:
     global _scheduler
     settings = get_settings()
@@ -59,6 +72,9 @@ def start_scheduler() -> AsyncIOScheduler | None:
         misfire_grace_time=60,
     )
     _scheduler.add_job(_prune, "interval", hours=1, id="prune_stale_jobs", max_instances=1)
+    _scheduler.add_job(
+        _purge_connections, "interval", hours=24, id="purge_connections", max_instances=1
+    )
     _scheduler.start()
     logger.info("Scheduler started (polling every %ds)", settings.poll_interval_seconds)
     return _scheduler

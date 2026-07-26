@@ -10,7 +10,7 @@ import asyncio
 
 import pytest
 
-from app.db.models import PlatformConnection, ProposalStatus
+from app.db.models import FreelancerProfile, PlatformConnection, ProposalStatus
 from app.services.bid_sync import AWARD_STATUS, _store_identity
 
 
@@ -46,9 +46,9 @@ class TestStoredIdentity:
     """
 
     @staticmethod
-    def _apply(payload: dict) -> PlatformConnection:
+    def _apply(payload: dict, profile: FreelancerProfile | None = None) -> PlatformConnection:
         connection = PlatformConnection()
-        asyncio.run(_store_identity(None, connection, payload))
+        asyncio.run(_store_identity(None, profile or FreelancerProfile(), connection, payload))
         return connection
 
     def test_maps_the_public_profile(self):
@@ -91,3 +91,30 @@ class TestStoredIdentity:
         c = self._apply({"id": 3, "registration_date": 1784569366})
         assert c.member_since is not None
         assert c.member_since.tzinfo is not None
+
+
+class TestHomeMirror:
+    """The account's home country/currency is mirrored onto the profile — where the app reads it."""
+
+    @staticmethod
+    def _mirror(payload: dict, profile: FreelancerProfile) -> None:
+        asyncio.run(_store_identity(None, profile, PlatformConnection(), payload))
+
+    def test_populates_a_fresh_profile(self):
+        profile = FreelancerProfile()
+        self._mirror(
+            {"id": 1, "primary_currency": {"code": "INR"}, "location": {"country": {"name": "India"}}},
+            profile,
+        )
+        assert profile.country == "India"
+        assert profile.currency == "INR"
+
+    def test_does_not_reinterpret_currency_once_a_floor_is_set(self):
+        # The freelancer entered a 500 floor — its currency is theirs to change, not the sync's.
+        profile = FreelancerProfile(fixed_project_min=500.0, currency="USD")
+        self._mirror(
+            {"id": 1, "primary_currency": {"code": "INR"}, "location": {"country": {"name": "India"}}},
+            profile,
+        )
+        assert profile.currency == "USD"  # respected
+        assert profile.country == "India"  # country still mirrors — it isn't tied to a number

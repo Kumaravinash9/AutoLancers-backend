@@ -174,6 +174,11 @@ async def store_token(
     elif username:
         existing.platform_username = username
 
+    # Reconnecting an account revives its soft-deleted row rather than spawning a duplicate — the
+    # upsert above already matched it by account id. A no-op for a row that was never disconnected.
+    existing.disconnected_at = None
+    existing.status = "ACTIVE"
+
     existing.access_token_encrypted = encrypt(token.access_token)
     # A refresh response may omit the refresh token; keep the one we already hold.
     if token.refresh_token:

@@ -220,6 +220,13 @@ class PlatformConnection(Base):
         DateTime(timezone=True), nullable=True
     )
     status: Mapped[str] = mapped_column(String(30), default="ACTIVE")
+    # Soft delete. Disconnecting an account sets this and scrubs the tokens, but keeps the row so a
+    # destructive delete never runs on the live database inline; a background purge removes rows
+    # long-disconnected (see ``services.connections``). Every read of "live" connections filters
+    # ``disconnected_at IS NULL``; ``None`` means active.
+    disconnected_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     user: Mapped[User] = relationship(back_populates="connections")
 
@@ -242,6 +249,11 @@ class FreelancerProfile(Base):
     bio: Mapped[str] = mapped_column(Text, default="")
 
     skills: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    # LLM-proposed skills the freelancer hasn't confirmed yet (see ``services.skill_suggest``).
+    # Kept apart from ``skills`` on purpose: only a confirmed skill feeds matching and scoring, so
+    # a suggestion can't inflate a score until the freelancer accepts it. Each entry is
+    # ``{name, weight, reason, source}`` — the reason is what the accept/reject UI shows.
+    suggested_skills: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
     portfolio: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
     experience: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
     education: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
@@ -250,7 +262,12 @@ class FreelancerProfile(Base):
     rate_min: Mapped[float] = mapped_column(Float, default=0.0)
     rate_max: Mapped[float] = mapped_column(Float, default=0.0)
     fixed_project_min: Mapped[float] = mapped_column(Float, default=0.0)
+    # The freelancer's home currency and country, mirrored from their connected account during sync
+    # (Freelancer derives currency from the account's country). ``currency`` is the one currency the
+    # app reasons in: scoring floors are stated in it, and job budgets are converted into it for an
+    # at-a-glance read. Defaults to USD until an account is connected.
     currency: Mapped[str] = mapped_column(String(10), default="USD")
+    country: Mapped[str | None] = mapped_column(String(100), nullable=True)
     availability: Mapped[str] = mapped_column(String(30), default="FULL_TIME")
 
     keywords_include: Mapped[list[str]] = mapped_column(JSONB, default=list)
@@ -265,6 +282,15 @@ class FreelancerProfile(Base):
     weight_competition: Mapped[float] = mapped_column(Float, default=10.0)
     weight_recency: Mapped[float] = mapped_column(Float, default=10.0)
 
+    # Resolved Freelancer skill IDs for the server-side discovery filter — the confirmed skills
+    # broadened into the marketplace's tag vocabulary (see ``services.skill_expansion``). Cached
+    # because computing it hits the LLM and the skill catalogue; ``search_skill_ids_key`` hashes
+    # the inputs so it recomputes only when the confirmed skills change, not every cycle. Distinct
+    # from ``skills``: this widens *what is fetched*, while ``skills`` decides *how good* each fetch
+    # is — so a broad discovery tag never inflates a match score.
+    search_skill_ids: Mapped[list[int]] = mapped_column(JSONB, default=list)
+    search_skill_ids_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     proposal_notes: Mapped[str] = mapped_column(Text, default="")
 
     # Tokenised reference only. Never raw card or bank details.
@@ -278,6 +304,13 @@ class FreelancerProfile(Base):
     # When their real bids were last pulled back from the marketplace. Null means no outcome has
     # ever been checked, which is why the UI must not report zero wins as a result.
     bids_synced_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # High-watermark for incremental discovery: the submit-time of the newest posting ingested so
+    # far. Each cycle fetches only projects posted after this, so a busy board can't push new
+    # postings past a single page of "newest" (see ``services.pipeline``). Null means never pulled
+    # — the first cycle bootstraps from the current newest page instead of backfilling everything.
+    last_project_submitted_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     status: Mapped[str] = mapped_column(String(30), default="ACTIVE")
@@ -368,6 +401,15 @@ class Recommendation(Base):
     score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
     # Per-component trace: [{"label": ..., "detail": ..., "points": ...}, ...]
     reasons: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+
+    # Cached semantic skill match (see ``services.matching``). The LLM call is only worth making on
+    # new or changed postings, so its 0-1 fit and one-line reason are stored here and reused on
+    # unchanged sightings. ``skill_match_key`` hashes the inputs (profile skills + job content) so
+    # the cache invalidates itself when either moves; ``None`` means it was never computed (no key,
+    # feature off, or the call failed) and scoring falls back to substring matching.
+    skill_match_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    skill_match_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    skill_match_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # A hard reject is the tool's decision; DISMISSED below is the user's. Keeping them apart is
     # what lets the rejected view explain itself.

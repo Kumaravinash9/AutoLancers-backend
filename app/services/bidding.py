@@ -107,7 +107,9 @@ async def submit_bid_for_recommendation(
     # token — and a remote rejection is not a substitute for our own guarantee.
     connection = await session.scalar(
         select(PlatformConnection).where(
-            PlatformConnection.user_id == user_id, PlatformConnection.platform == "freelancer"
+            PlatformConnection.user_id == user_id,
+            PlatformConnection.platform == "freelancer",
+            PlatformConnection.disconnected_at.is_(None),
         )
     )
     availability = check_availability(connection)
