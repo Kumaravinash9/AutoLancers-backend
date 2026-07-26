@@ -315,3 +315,51 @@ class ProposalVersion(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Skill(Base):
+    """Canonical skill tag, e.g. "React".
+
+    From ``docs/target-schema.sql`` §4b. The JSONB ``Profile.skills`` stays the editable source of
+    truth; these rows are the queryable index of it, so matching can happen in SQL instead of by
+    loading every profile into Python.
+    """
+
+    __tablename__ = "skills"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    # Freelancer's own numeric id, so a resolved skill doesn't need re-resolving every cycle.
+    freelancer_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class ProfileSkill(Base):
+    """Weighted link from a profile to a canonical skill.
+
+    Named for our ``profiles`` table rather than the target schema's ``freelancer_profiles``;
+    renaming the table is part of the pending cutover, not of adding this index.
+    """
+
+    __tablename__ = "profile_skills"
+
+    profile_id: Mapped[int] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"), primary_key=True
+    )
+    skill_id: Mapped[int] = mapped_column(
+        ForeignKey("skills.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    tier: Mapped[str] = mapped_column(String(20), default="primary")  # primary | secondary
+
+
+class JobSkill(Base):
+    """Skills a posting asked for, as canonical tags."""
+
+    __tablename__ = "job_skills"
+
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    skill_id: Mapped[int] = mapped_column(
+        ForeignKey("skills.id", ondelete="CASCADE"), primary_key=True, index=True
+    )

@@ -18,11 +18,31 @@ The frontend lives in a separate repo: `AutoLancers-frontend`.
 ## Setup
 
 ```bash
+./scripts/bootstrap.sh
+```
+
+That installs dependencies, starts Postgres, writes a `.env` with freshly generated encryption
+and session keys, and applies every migration. It is idempotent — re-running it is safe and will
+not touch existing data.
+
+Then:
+
+```bash
+uv run python scripts/create_admin.py you@example.com   # first admin
+uv run python scripts/seed_demo_jobs.py                 # optional sample data
+uv run uvicorn app.main:app --reload --port 8010
+```
+
+<details>
+<summary>Manual setup, if you'd rather not run the script</summary>
+
+```bash
 uv sync
 docker compose up -d      # Postgres on port 5434
-cp .env.example .env      # then fill it in
+cp .env.example .env      # then fill in the keys it lists
 uv run alembic upgrade head
 ```
+</details>
 
 Postgres runs on **5434** and the API on **8010** rather than the usual 5432/8000, because both of
 those are commonly already taken on a dev machine and a silent port collision is a confusing
@@ -90,3 +110,28 @@ uv run pytest
   session-authenticated socket that is not part of the public API.
 - Auth uses Freelancer's own header, not `Authorization: Bearer`.
 - Their terms require cached data to be refreshed at least every 24h; `prune_stale_jobs` handles it.
+
+
+## Schema
+
+`docs/target-schema.sql` is the **design reference** for the multi-user data model — read it to
+understand where this is going. **Do not run it against a database.** Tables are created only by
+Alembic migrations generated from `app/db/models.py`, which is the single source of truth;
+executing the SQL alongside them produces orphan tables Alembic doesn't track, and collides on
+`users`.
+
+To change the schema:
+
+```bash
+# edit app/db/models.py, then
+uv run alembic revision --autogenerate -m "what changed"
+uv run alembic upgrade head
+```
+
+Check the generated migration before applying it. Autogenerate cannot know that adding a
+`NOT NULL` column to a populated table needs a `server_default`, and will produce a migration that
+fails on any database with rows in it.
+
+Still to adopt from the target schema: UUID primary keys, and splitting `projects` (one row per
+posting) from `recommendations` (one row per user per posting). Today `jobs` merges the two, which
+means a posting is stored once per user — fine for one user, wasteful for a thousand.
