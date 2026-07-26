@@ -6,10 +6,12 @@ bid *means* — which is where a wrong assumption would quietly corrupt your win
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from app.db.models import ProposalStatus
-from app.services.bid_sync import AWARD_STATUS
+from app.db.models import PlatformConnection, ProposalStatus
+from app.services.bid_sync import AWARD_STATUS, _store_identity
 
 
 class TestAwardStatusMapping:
@@ -34,3 +36,58 @@ class TestAwardStatusMapping:
         """
         resolved = AWARD_STATUS.get(str(award or "").lower(), ProposalStatus.SUBMITTED)
         assert resolved == ProposalStatus.SUBMITTED
+
+
+class TestStoredIdentity:
+    """Mapping the marketplace's own record of an account onto the connection row.
+
+    Every field here is what a client sees on the marketplace, so a wrong mapping shows the wrong
+    person's details on a card rather than failing loudly.
+    """
+
+    @staticmethod
+    def _apply(payload: dict) -> PlatformConnection:
+        connection = PlatformConnection()
+        asyncio.run(_store_identity(None, connection, payload))
+        return connection
+
+    def test_maps_the_public_profile(self):
+        c = self._apply(
+            {
+                "id": 93912309,
+                "username": "aiinno",
+                "public_name": "Avinash K.",
+                "tagline": "Team of IIT Engineers",
+                "profile_description": "AI & Backend Engineer.",
+                "jobs": [{"name": "Software Architecture"}, {"name": "MongoDB"}],
+                "hourly_rate": 25.0,
+                "primary_currency": {"code": "INR"},
+                "location": {"country": {"name": "India"}},
+                "portfolio_count": 3,
+            }
+        )
+        assert c.display_name == "Avinash K."
+        assert c.tagline == "Team of IIT Engineers"
+        assert c.account_skills == ["Software Architecture", "MongoDB"]
+        assert c.hourly_rate == 25.0
+        assert c.currency == "INR"
+        assert c.country == "India"
+        assert c.portfolio_count == 3
+
+    def test_protocol_relative_avatar_is_made_loadable(self):
+        """The API returns //host/path in places, which resolves to nothing in an img tag."""
+        c = self._apply({"id": 1, "avatar_large_cdn": "//cdn2.f-cdn.com/ppic/1/logo.jpg"})
+        assert c.avatar_url == "https://cdn2.f-cdn.com/ppic/1/logo.jpg"
+
+    def test_a_bare_account_leaves_fields_empty_rather_than_guessing(self):
+        c = self._apply({"id": 2, "username": "newcomer"})
+        assert c.platform_username == "newcomer"
+        assert c.account_skills == []
+        assert c.tagline is None
+        assert c.hourly_rate is None
+        assert c.member_since is None
+
+    def test_registration_date_becomes_an_aware_datetime(self):
+        c = self._apply({"id": 3, "registration_date": 1784569366})
+        assert c.member_since is not None
+        assert c.member_since.tzinfo is not None

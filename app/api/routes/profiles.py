@@ -15,7 +15,7 @@ import datetime as dt
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import (
@@ -25,6 +25,7 @@ from app.api.schemas import (
     ProfileDetail,
     ProfileIn,
     ProfileOut,
+    SelectionIn,
 )
 from app.db.models import (
     FreelancerProfile,
@@ -120,7 +121,9 @@ async def _card(
     }
 
 
-def _connection_out(c: PlatformConnection, proposals: int = 0, wins: int = 0) -> ConnectionOut:
+def _connection_out(
+    c: PlatformConnection, proposals: int = 0, wins: int = 0, selected: bool = False
+) -> ConnectionOut:
     """One connection as the API returns it.
 
     Built in one place because both the profile detail and the connections list serve the same
@@ -139,6 +142,7 @@ def _connection_out(c: PlatformConnection, proposals: int = 0, wins: int = 0) ->
         # picture so the UI can fall back to initials instead.
         avatar_url=None if (c.avatar_url or "").endswith("unknown.png") else c.avatar_url,
         status=c.status,
+        is_selected=selected,
         display_name=c.display_name,
         tagline=c.tagline,
         summary=c.summary,
@@ -330,9 +334,50 @@ async def list_connections(session: AsyncSession = Depends(get_session)) -> list
             or 0
         )
         out.append(
-            _connection_out(c, proposals=placed, wins=won)
+            _connection_out(
+                c, proposals=placed, wins=won, selected=c.is_selected
+            )
         )
     return out
+
+
+@router.put("/connections/selected", response_model=list[ConnectionOut])
+async def select_connection(
+    payload: SelectionIn, session: AsyncSession = Depends(get_session)
+) -> list[ConnectionOut]:
+    """Scope the app to one connected account, or to all of them with a null id.
+
+    Stored on the user rather than in the browser so the choice survives a new device and so the
+    API can honour it later without the client having to restate it on every request.
+    """
+    user = await get_or_create_default_user(session)
+
+    if payload.connection_id is not None:
+        owned = await session.scalar(
+            select(PlatformConnection).where(
+                PlatformConnection.id == payload.connection_id,
+                PlatformConnection.user_id == user.id,
+            )
+        )
+        # 404 rather than 403: whether someone else's connection exists is not ours to confirm.
+        if owned is None:
+            raise HTTPException(status_code=404, detail="No such connection.")
+
+    # Clear first, then set: the partial unique index rejects a second selected row, so the two
+    # statements have to be in this order within the transaction.
+    await session.execute(
+        update(PlatformConnection)
+        .where(PlatformConnection.user_id == user.id, PlatformConnection.is_selected.is_(True))
+        .values(is_selected=False)
+    )
+    if payload.connection_id is not None:
+        await session.execute(
+            update(PlatformConnection)
+            .where(PlatformConnection.id == payload.connection_id)
+            .values(is_selected=True)
+        )
+    await session.commit()
+    return await list_connections(session)
 
 
 @router.delete("/connections/{connection_id}", status_code=204)

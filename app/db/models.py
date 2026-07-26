@@ -26,10 +26,12 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -128,6 +130,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(16), default=Role.USER, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -163,6 +166,14 @@ class PlatformConnection(Base):
         UniqueConstraint(
             "user_id", "platform", "platform_user_id", name="uq_connection_user_platform_account"
         ),
+        # At most one selected account per user. A partial index enforces that in the database
+        # rather than trusting every write path to clear the previous one first.
+        Index(
+            "uq_selected_connection_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_selected"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -181,6 +192,10 @@ class PlatformConnection(Base):
     # The avatar as the marketplace serves it. Stored per connection rather than per user because
     # the same person can present differently on Freelancer and Upwork.
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Which account the app is scoped to. All false means all accounts — a real state, not an
+    # unset one, so it is the default rather than something the user has to choose.
+    is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # The account's own public profile, as the marketplace holds it — distinct from the
     # ``freelancer_profiles`` row, which is our scoring configuration. Two Freelancer accounts run

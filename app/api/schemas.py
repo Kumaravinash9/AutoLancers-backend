@@ -283,6 +283,8 @@ class ConnectionOut(BaseModel):
     total_reviews: int | None
     avatar_url: str | None
     status: str
+    # True for the account the app is currently scoped to. At most one connection has it.
+    is_selected: bool = False
     # The account's public profile on the marketplace, mirrored on each sync.
     display_name: str | None = None
     tagline: str | None = None
@@ -366,3 +368,9 @@ class FullSyncOut(BaseModel):
 
     last_synced_at: dt.datetime | None
     bids_synced_at: dt.datetime | None
+
+
+class SelectionIn(BaseModel):
+    """Which account to scope the app to. ``None`` means all of them."""
+
+    connection_id: uuid.UUID | None = None
