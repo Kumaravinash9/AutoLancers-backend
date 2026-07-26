@@ -195,3 +195,50 @@ class AdminOverview(BaseModel):
     failed_cycles_24h: int
     draft_failures_24h: int
     last_cycle_at: dt.datetime | None
+
+
+class ProposalOut(BaseModel):
+    """A bid or draft, with the score that recommended it.
+
+    Pairing the two is the point: it's the only way to tell whether the scoring is picking work
+    you actually win, rather than work that merely looks good on paper.
+    """
+
+    id: uuid.UUID
+    recommendation_id: uuid.UUID | None
+    project_title: str
+    project_url: str
+    platform: str
+    external_id: str | None
+
+    score: float | None
+    reasons: list[dict[str, Any]]
+
+    proposal_text: str | None
+    bid_amount: float | None
+    estimated_days: int | None
+    currency: str | None
+
+    status: str
+    submitted_via: str | None
+    external_bid_id: str | None
+    submitted_at: dt.datetime | None
+    drafted_at: dt.datetime | None
+    created_at: dt.datetime
+
+    model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+
+
+class ProposalStats(BaseModel):
+    """Outcome by score band — does a higher score actually convert?"""
+
+    total: int
+    drafted: int
+    submitted: int
+    accepted: int
+    rejected: int
+    avg_score_submitted: float | None
+    avg_score_accepted: float | None
+    total_output_tokens: int
