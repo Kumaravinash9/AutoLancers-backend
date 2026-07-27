@@ -204,17 +204,22 @@ async def _fetch_new_postings(
     from_time = int((since - WATERMARK_OVERLAP).timestamp()) if since is not None else None
 
     collected: list[JobPosting] = []
-    for page in range(max_pages):
+    offset = 0
+    for _ in range(max_pages):
         batch = await client.search_active_projects(
             skill_ids=skill_ids or None,
             from_time=from_time,
-            offset=page * DISCOVERY_PAGE_SIZE,
+            offset=offset,
             limit=DISCOVERY_PAGE_SIZE,
         )
+        if not batch:
+            return collected, False  # an empty page means the board ran out — we caught up
         collected.extend(batch)
-        if len(batch) < DISCOVERY_PAGE_SIZE:
-            return collected, False  # a short page means the board ran out — we caught up
-    return collected, True  # every page was full — more likely remain than not
+        # Advance by what actually came back, not by our requested page size: Freelancer caps a page
+        # at its own maximum (≈50), so assuming we got a full ``DISCOVERY_PAGE_SIZE`` would skip
+        # rows and, worse, stop after one short page. Only an empty page means "done".
+        offset += len(batch)
+    return collected, True  # hit the page cap without draining — more likely remain than not
 
 
 def _search_skill_ids_key(names: list[str], expansion_enabled: bool) -> str:

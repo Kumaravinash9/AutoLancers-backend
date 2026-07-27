@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 # Module-wide cache for the skill catalogue (see ``fetch_skill_catalogue``). It's the same static,
 # account-independent list for everyone, so one copy shared across client instances is correct.
 _CATALOGUE_TTL_SECONDS = 24 * 3600
+_CATALOGUE_PAGE_SIZE = 1000
+_CATALOGUE_MAX_PAGES = 20  # backstop: 20k skills is far above Freelancer's real count
 _catalogue_cache: dict[str, int] | None = None
 _catalogue_fetched_at: float = 0.0
 
@@ -193,18 +195,36 @@ class FreelancerClient:
     async def fetch_skill_catalogue(self) -> dict[str, int]:
         """Return Freelancer's whole skill list as ``{lowercased name: id}``.
 
-        The catalogue is large (~2000 entries) but effectively static and account-independent, so
-        it's cached module-wide for ``_CATALOGUE_TTL_SECONDS``. Without the cache this 2000-row
-        fetch rode along with every skill resolution; now it's paid once a day at most.
+        Paged to completion rather than capped at a single request: Freelancer limits a page to its
+        own maximum, so one call would silently truncate the dictionary and lose skills we could
+        match on. The catalogue is effectively static and account-independent, so the full result is
+        cached module-wide for ``_CATALOGUE_TTL_SECONDS`` — paid once a day at most.
         """
         global _catalogue_cache, _catalogue_fetched_at
         now = time.monotonic()
         if _catalogue_cache is not None and (now - _catalogue_fetched_at) < _CATALOGUE_TTL_SECONDS:
             return _catalogue_cache
 
-        response = await self._get(f"{API_BASE}{JOBS_PATH}", {"limit": 2000})
-        entries = response.get("result") or []
-        catalogue = {e["name"].lower(): e["id"] for e in entries if e.get("name") and e.get("id")}
+        catalogue: dict[str, int] = {}
+        offset = 0
+        for _ in range(_CATALOGUE_MAX_PAGES):
+            response = await self._get(
+                f"{API_BASE}{JOBS_PATH}", {"limit": _CATALOGUE_PAGE_SIZE, "offset": offset}
+            )
+            entries = response.get("result") or []
+            if not entries:
+                break
+            before = len(catalogue)
+            for e in entries:
+                if e.get("name") and e.get("id"):
+                    catalogue[e["name"].lower()] = e["id"]
+            # Stop on an empty page, or if a full page added nothing new — the latter guards against
+            # an endpoint that ignores ``offset`` and would otherwise loop on the same first page.
+            if len(catalogue) == before:
+                break
+            offset += len(entries)
+
+        logger.info("Loaded %d Freelancer skills into the catalogue", len(catalogue))
         if catalogue:  # never cache an empty catalogue — that's a bad response, not a real answer
             _catalogue_cache = catalogue
             _catalogue_fetched_at = now
