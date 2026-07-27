@@ -25,6 +25,7 @@ import httpx
 from app.config import get_settings
 from app.connectors.freelancer import JobPosting
 from app.db.models import FreelancerProfile
+from app.services.llm import LLMError, complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -120,8 +121,19 @@ async def match_skills(job: JobPosting, profile: FreelancerProfile) -> SkillMatc
         if not settings.anthropic_api_key:
             return None
         return await _match_with_anthropic(message)
+    if settings.llm_provider == "nvidia":
+        if not settings.nvidia_api_key:
+            return None
+        try:
+            result = await complete_json(
+                _SYSTEM_PROMPT, message, _SCHEMA, MAX_OUTPUT_TOKENS, "skill_match"
+            )
+        except LLMError as exc:
+            raise MatchingError(str(exc)) from exc
+        return _parse(json.dumps(result["data"]))
     raise MatchingError(
-        f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected 'gemini' or 'anthropic'"
+        f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected "
+        "'gemini', 'anthropic' or 'nvidia'"
     )
 
 

@@ -34,7 +34,7 @@ from app.services.bidding import (
 )
 from app.services.currency import convert
 from app.services.drafting import DraftingError, draft_proposal
-from app.services.pipeline import _to_posting, rescore_all
+from app.services.pipeline import rescore_all, to_posting
 from app.services.users import get_or_create_default_user, get_or_create_profile
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -263,7 +263,7 @@ async def draft(job_id: uuid.UUID, session: AsyncSession = Depends(get_session))
     profile = await _profile_for(session, None)
 
     try:
-        generated = await draft_proposal(_to_posting(rec.project), profile)
+        generated = await draft_proposal(to_posting(rec.project), profile)
     except DraftingError as exc:
         # 502: the failure is upstream at the model provider, not in the request.
         raise HTTPException(status_code=502, detail=str(exc)) from exc

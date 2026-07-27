@@ -660,3 +660,27 @@ class DemoRequest(Base):
 
     handled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ApiToken(Base):
+    """A long-lived credential for a client that has no browser session — the extension.
+
+    Only the hash is stored. A token is shown once at creation and is unrecoverable afterwards,
+    which is the whole point: a leaked database gives an attacker nothing to replay.
+    """
+
+    __tablename__ = "api_tokens"
+
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = _fk("users.id", index=True)
+
+    # What it's for, so revoking the right one doesn't take guesswork.
+    name: Mapped[str] = mapped_column(String(100), default="Chrome extension")
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_used_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Revoked rather than deleted: "this token was used, then revoked" is worth being able to see.
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

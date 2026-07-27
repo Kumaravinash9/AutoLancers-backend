@@ -67,8 +67,67 @@ async def draft_proposal(job: JobPosting, profile: FreelancerProfile) -> Draft:
         return await _draft_with_gemini(message)
     if settings.llm_provider == "anthropic":
         return await _draft_with_anthropic(message)
+    if settings.llm_provider == "nvidia":
+        return await _draft_with_openai_compatible(message)
     raise DraftingError(
-        f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected 'gemini' or 'anthropic'"
+        f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected "
+        "'gemini', 'anthropic' or 'nvidia'"
+    )
+
+
+async def _draft_with_openai_compatible(message: str) -> Draft:
+    """A proposal is prose, not JSON, so this talks to the chat endpoint directly.
+
+    It cannot reuse ``llm.complete_json`` — asking for a schema here would wrap the proposal in
+    quotes and escape every newline, which is not what gets pasted into a bid.
+    """
+    settings = get_settings()
+    if not settings.nvidia_api_key:
+        raise DraftingError("NVIDIA_API_KEY is not set")
+
+    payload = {
+        "model": settings.nvidia_model,
+        "messages": [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "user", "content": message},
+        ],
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "temperature": 0.7,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                f"{settings.nvidia_base_url.rstrip('/')}/chat/completions",
+                headers={
+                    "authorization": f"Bearer {settings.nvidia_api_key}",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+    except httpx.HTTPError as exc:
+        raise DraftingError(f"Could not reach {settings.nvidia_base_url}: {exc}") from exc
+
+    if response.status_code >= 400:
+        raise DraftingError(f"Provider returned {response.status_code}: {response.text[:300]}")
+
+    data = response.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise DraftingError("Provider returned no choices.")
+
+    text = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if not text:
+        raise DraftingError("Provider returned an empty draft.")
+    if choices[0].get("finish_reason") == "length":
+        raise DraftingError("Provider hit the output limit — the draft would be cut mid-sentence.")
+
+    usage = data.get("usage") or {}
+    return Draft(
+        text=text,
+        model=data.get("model") or settings.nvidia_model,
+        input_tokens=usage.get("prompt_tokens") or 0,
+        output_tokens=usage.get("completion_tokens") or 0,
     )
 
 

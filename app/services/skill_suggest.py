@@ -29,6 +29,7 @@ import httpx
 
 from app.config import get_settings
 from app.db.models import FreelancerProfile, PlatformConnection
+from app.services.llm import LLMError, complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +145,20 @@ async def suggest_skills(
         if not settings.anthropic_api_key:
             raise SkillSuggestError("ANTHROPIC_API_KEY is not set")
         raw = await _suggest_with_anthropic(message)
+    elif settings.llm_provider == "nvidia":
+        if not settings.nvidia_api_key:
+            raise SkillSuggestError("NVIDIA_API_KEY is not set")
+        try:
+            result = await complete_json(
+                _SYSTEM_PROMPT, message, _SCHEMA, MAX_OUTPUT_TOKENS, "skill_suggestions"
+            )
+        except LLMError as exc:
+            raise SkillSuggestError(str(exc)) from exc
+        raw = _parse(json.dumps(result["data"]))
     else:
         raise SkillSuggestError(
-            f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected 'gemini' or 'anthropic'"
+            f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected "
+            "'gemini', 'anthropic' or 'nvidia'"
         )
 
     return _finalise(raw, already_listed=profile.skills or [])

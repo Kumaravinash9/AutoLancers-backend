@@ -421,3 +421,85 @@ class DemoRequestOut(BaseModel):
     marketplace: str | None
     handled: bool
     created_at: dt.datetime
+
+
+class CapturedPosting(BaseModel):
+    """A posting read off a page by the extension.
+
+    Everything optional is genuinely optional: marketplace layouts vary and a field the scraper
+    couldn't find must arrive as null, never as zero. Scoring skips a filter it has no input for,
+    so a missing budget means "unknown" rather than "free".
+    """
+
+    platform: str = Field(default="upwork", max_length=50)
+    external_id: str = Field(min_length=1, max_length=200)
+    url: str = Field(max_length=1000)
+    title: str = Field(min_length=1, max_length=500)
+    description: str = ""
+    skills: list[str] = []
+    work_type: str | None = None
+    budget_min: float | None = None
+    budget_max: float | None = None
+    currency: str | None = None
+    proposal_count: int | None = None
+    posted_at: dt.datetime | None = None
+
+
+class CaptureResult(BaseModel):
+    project_id: uuid.UUID
+    recommendation_id: uuid.UUID
+    created: bool
+    score: float
+    rejected: bool
+    rejection_reason: str | None
+    reasons: list[dict[str, Any]]
+
+
+class CapturedProfile(BaseModel):
+    """Your own marketplace profile, read off your profile page."""
+
+    platform: str = Field(default="upwork", max_length=50)
+    username: str = Field(min_length=1, max_length=255)
+    display_name: str | None = None
+    tagline: str | None = None
+    summary: str | None = None
+    skills: list[str] = []
+    hourly_rate: float | None = None
+    currency: str | None = None
+    country: str | None = None
+    avatar_url: str | None = None
+    rating: float | None = None
+    total_reviews: int | None = None
+
+
+class ApiTokenOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    created_at: dt.datetime
+    last_used_at: dt.datetime | None
+
+
+class ApiTokenCreated(ApiTokenOut):
+    """The plaintext is returned exactly once, at creation, and never stored."""
+
+    token: str
+
+
+class ApiTokenIn(BaseModel):
+    name: str = Field(default="Chrome extension", max_length=100)
+
+
+class PageParseIn(BaseModel):
+    """Visible text of a page, for the LLM reader."""
+
+    kind: str = Field(pattern="^(profile|job)$")
+    url: str = Field(default="", max_length=1000)
+    text: str = Field(min_length=40, max_length=200_000)
+
+
+class PageParseOut(BaseModel):
+    fields: dict[str, Any]
+    model: str
+    input_tokens: int | None
+    output_tokens: int | None
+    truncated_input: bool

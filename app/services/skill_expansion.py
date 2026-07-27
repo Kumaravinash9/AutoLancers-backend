@@ -25,6 +25,7 @@ import logging
 import httpx
 
 from app.config import get_settings
+from app.services.llm import LLMError, complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +100,20 @@ async def expand_skill_terms(names: list[str]) -> list[str]:
         if not settings.anthropic_api_key:
             return []
         raw = await _expand_with_anthropic(message)
+    elif settings.llm_provider == "nvidia":
+        if not settings.nvidia_api_key:
+            return []
+        try:
+            result = await complete_json(
+                _SYSTEM_PROMPT, message, _SCHEMA, MAX_OUTPUT_TOKENS, "skill_expansion"
+            )
+        except LLMError as exc:
+            raise SkillExpansionError(str(exc)) from exc
+        raw = _parse(json.dumps(result["data"]))
     else:
         raise SkillExpansionError(
-            f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected 'gemini' or 'anthropic'"
+            f"Unknown LLM_PROVIDER {settings.llm_provider!r} — expected "
+            "'gemini', 'anthropic' or 'nvidia'"
         )
 
     return _finalise(raw, listed=names)

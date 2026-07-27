@@ -91,7 +91,7 @@ Everything lives in `.env`; `.env.example` lists every key with a comment. The o
 | Key | Default | Notes |
 |---|---|---|
 | `DATABASE_URL` | `…@localhost:5434/automatelancers` | |
-| `LLM_PROVIDER` | `gemini` | `gemini` or `anthropic` |
+| `LLM_PROVIDER` | `gemini` | `gemini`, `anthropic` or `nvidia` |
 | `GEMINI_API_KEY` | — | required unless using Anthropic |
 | `POLL_INTERVAL_SECONDS` | `1800` | 30 minutes |
 | `SCHEDULER_ENABLED` | `true` | set `false` to run the API without the poller |
@@ -125,8 +125,14 @@ is hyperbolic so a 30-bid and a 300-bid job stay distinguishable.
 
 | Provider | Setting | Default model |
 |---|---|---|
-| Google Gemini (default) | `LLM_PROVIDER=gemini` + `GEMINI_API_KEY` | `gemini-3.6-flash` |
+| Google Gemini | `LLM_PROVIDER=gemini` + `GEMINI_API_KEY` | `gemini-3.6-flash` |
 | Anthropic | `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | `claude-opus-5` |
+| Any OpenAI-compatible endpoint | `LLM_PROVIDER=nvidia` + `NVIDIA_API_KEY` + `NVIDIA_BASE_URL` | `z-ai/glm-5.2` |
+
+The third is named for the host it was tested against, but the base URL is configurable — a
+self-hosted vLLM or another aggregator works with no code change. It is worth having because the
+Gemini free tier returns 429 once its daily quota is gone, and that takes drafting, skill matching,
+skill suggestion and page parsing with it.
 
 The prompt (`app/prompts/proposal_system.md`) is provider-neutral, so switching is a config change.
 
@@ -135,6 +141,12 @@ as the reply.** On real postings a ~150-word proposal costs ~200 visible tokens 
 thinking tokens, so `MAX_OUTPUT_TOKENS` is deliberately generous — sizing it for the visible text
 alone returns an empty draft. Thinking tokens are counted into stored token usage so cost per bid
 isn't understated.
+
+All five LLM paths honour the same switch — drafting, semantic skill matching, skill suggestion,
+discovery-skill expansion and page parsing. The JSON ones share one client
+(`app/services/llm.py`); drafting talks to the chat endpoint directly, because asking for a schema
+would return the proposal wrapped in quotes with every newline escaped, which is not what gets
+pasted into a bid.
 
 **Free-tier Gemini has per-minute and per-day limits.** A cycle drafts at most
 `MAX_DRAFTS_PER_CYCLE` (5), and a rate-limited draft is logged and retried next cycle rather than

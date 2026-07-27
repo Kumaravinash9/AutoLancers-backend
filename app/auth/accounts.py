@@ -18,6 +18,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import tokens as api_tokens
 from app.config import get_settings
 from app.db.models import Role, User, utcnow
 from app.db.session import get_session
@@ -87,6 +88,15 @@ async def current_user(
     The role is re-read from the database rather than trusted from the token, so revoking an
     admin takes effect immediately instead of when their session happens to expire.
     """
+    # A bearer token first: the Chrome extension runs on Upwork's origin and never carries our
+    # session cookie. Both are first-class credentials; neither is a fallback for the other.
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        holder = await api_tokens.resolve(session, header[7:].strip())
+        if holder is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or revoked API token.")
+        return holder
+
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not signed in.")

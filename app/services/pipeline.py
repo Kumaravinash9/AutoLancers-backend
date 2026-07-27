@@ -468,7 +468,7 @@ async def _draft_pending(session: AsyncSession, profile: FreelancerProfile) -> t
     drafted = failures = 0
     for rec in rows:
         try:
-            draft = await draft_proposal(_to_posting(rec.project), profile)
+            draft = await draft_proposal(to_posting(rec.project), profile)
         except DraftingError as exc:
             failures += 1
             logger.warning("Draft failed for project %s: %s", rec.project.external_id, exc)
@@ -531,7 +531,7 @@ async def rescore_all(session: AsyncSession, profile: FreelancerProfile) -> int:
         if rec.project.content_hash:
             key = _skill_match_key(profile, rec.project.content_hash)
             skill_match = _cached_skill_match(rec, key)
-        result = score_job(_to_posting(rec.project), profile, skill_match=skill_match)
+        result = score_job(to_posting(rec.project), profile, skill_match=skill_match)
         rec.score = result.score
         rec.reasons = result.reasons
         rec.is_hard_rejected = result.rejected
@@ -591,7 +591,7 @@ async def _record(
         logger.exception("Could not record cycle run")
 
 
-def _to_posting(project: Project) -> JobPosting:
+def to_posting(project: Project) -> JobPosting:
     """Back to the platform-neutral shape scoring and drafting work with."""
     return JobPosting(
         platform=project.platform,

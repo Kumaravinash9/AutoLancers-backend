@@ -257,7 +257,7 @@ async def _attach_recommendation(
         )
     )
     if rec is None:
-        result = score_job(_to_posting(project), profile)
+        result = score_job(to_posting(project), profile)
         rec = Recommendation(
             freelancer_id=profile.id,
             project_id=project.id,
@@ -297,7 +297,7 @@ def _project_from(posting: JobPosting) -> Project:
     )
 
 
-def _to_posting(project: Project) -> JobPosting:
+def to_posting(project: Project) -> JobPosting:
     return JobPosting(
         platform=project.platform,
         external_id=project.external_id or "",

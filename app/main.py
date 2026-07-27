@@ -7,7 +7,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import accounts, admin, auth, demo, jobs, pipeline, profiles, proposals
+from app.api.routes import (
+    accounts,
+    admin,
+    auth,
+    demo,
+    ingest,
+    jobs,
+    pipeline,
+    profiles,
+    proposals,
+)
 from app.config import get_settings
 from app.scheduler import start_scheduler, stop_scheduler
 
@@ -30,6 +40,10 @@ app = FastAPI(title="AutoLancers", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[get_settings().frontend_origin],
+    # The extension calls from Upwork's page context under its own chrome-extension:// origin,
+    # which is not knowable ahead of time — the id changes per install. It authenticates with a
+    # bearer token, not a cookie, so widening the origin here grants nothing on its own.
+    allow_origin_regex=r"chrome-extension://[a-p]+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,5 +56,6 @@ app.include_router(accounts.router)
 app.include_router(admin.router)
 app.include_router(proposals.router)
 app.include_router(profiles.router)
+app.include_router(ingest.router)
 app.include_router(demo.router)
 app.include_router(demo.admin_router)

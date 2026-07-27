@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # Cookies are only marked Secure over HTTPS; leave false for local http development.
     cookie_secure: bool = False
 
-    # Which LLM drafts proposals and judges skill matches: "gemini" or "anthropic".
+    # Which LLM drafts proposals and judges skill matches: "gemini", "anthropic" or "nvidia".
     llm_provider: str = "gemini"
 
     anthropic_api_key: str = ""
@@ -29,6 +29,12 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.6-flash"
+
+    # Any OpenAI-compatible endpoint. Named for the host we test against, but the base URL is
+    # configurable, so a self-hosted vLLM or another aggregator works with no code change.
+    nvidia_api_key: str = ""
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    nvidia_model: str = "z-ai/glm-5.2"
 
     # Semantic skill matching (see app/services/matching.py). The pipeline only pays for it on
     # postings that pass the hard filters and aren't already cached, and never more than
