@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from app.config import Settings
-from app.db.models import FreelancerProfile, PlatformConnection
+from app.db.models import FreelancerProfile
 from app.services import skill_suggest
 from app.services.skill_suggest import (
     MAX_SUGGESTIONS,
@@ -95,15 +95,15 @@ class TestUserMessage:
         return FreelancerProfile(**defaults)
 
     def test_includes_listed_skills_and_evidence(self):
-        conn = PlatformConnection(account_skills=["PHP", "WordPress"], summary="Freelance builder")
-        msg = _build_user_message(self._profile(), [conn], ["Hi, I can build your store in Next.js."])
+        profile = self._profile(account_skills=["PHP", "WordPress"], summary="Freelance builder")
+        msg = _build_user_message(profile, ["Hi, I can build your store in Next.js."])
         assert "React" in msg  # already-listed
-        assert "PHP" in msg and "WordPress" in msg  # account skills
+        assert "PHP" in msg and "WordPress" in msg  # account skills (now on the profile)
         assert "Next.js storefront" in msg  # portfolio
         assert "build your store" in msg  # proposal sample
 
     def test_tolerates_empty_evidence(self):
-        msg = _build_user_message(self._profile(skills=[], portfolio=[], bio=""), [], [])
+        msg = _build_user_message(self._profile(skills=[], portfolio=[], bio=""), [])
         assert "none" in msg  # no skills listed, no account skills, no proposals
 
 
@@ -111,17 +111,17 @@ class TestProviderSelection:
     async def test_unknown_provider_is_a_clear_error(self, settings):
         settings(llm_provider="mystery")
         with pytest.raises(SkillSuggestError, match="Unknown LLM_PROVIDER"):
-            await suggest_skills(FreelancerProfile(skills=[]), [], [])
+            await suggest_skills(FreelancerProfile(skills=[]), [])
 
     async def test_missing_gemini_key_is_a_clear_error(self, settings):
         settings(llm_provider="gemini")
         with pytest.raises(SkillSuggestError, match="GEMINI_API_KEY"):
-            await suggest_skills(FreelancerProfile(skills=[]), [], [])
+            await suggest_skills(FreelancerProfile(skills=[]), [])
 
     async def test_missing_anthropic_key_is_a_clear_error(self, settings):
         settings(llm_provider="anthropic")
         with pytest.raises(SkillSuggestError, match="ANTHROPIC_API_KEY"):
-            await suggest_skills(FreelancerProfile(skills=[]), [], [])
+            await suggest_skills(FreelancerProfile(skills=[]), [])
 
 
 class TestGeminiSchema:

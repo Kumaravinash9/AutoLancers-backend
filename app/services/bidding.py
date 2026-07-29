@@ -25,7 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.freelancer_oauth import OAuthError, get_valid_access_token, has_bid_scope
 from app.config import get_settings
-from app.connectors.freelancer import FreelancerAPIError, FreelancerClient
+from app.connectors import create_connector
+from app.connectors.freelancer import FreelancerAPIError
 from app.db.models import (
     PlatformConnection,
     ProposalStatus,
@@ -121,7 +122,7 @@ async def submit_bid_for_recommendation(
     except OAuthError as exc:
         raise BiddingError(str(exc)) from exc
 
-    client = FreelancerClient(access_token=token)
+    client = create_connector(connection.platform, access_token=token)
 
     try:
         bidder_id = await client.fetch_self_id()

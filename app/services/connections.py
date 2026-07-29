@@ -28,18 +28,17 @@ PURGE_AFTER = dt.timedelta(days=30)
 
 
 def disconnect_connection(connection: PlatformConnection) -> None:
-    """Soft-delete a connection: mark it disconnected, scrub its tokens, and drop its selection.
+    """Soft-delete a connection: mark it disconnected and scrub its tokens.
 
     Pure mutation of the row — the caller owns the commit — so a wrong flow can't destroy the
-    credential inline, and the token never lingers for an account the user has disconnected.
+    credential inline, and the token never lingers for an account the user has disconnected. The
+    app's selection lives on the profile now; clearing it when the scoped account is removed is the
+    caller's job (see ``routes.profiles.remove_connection``).
     """
     connection.disconnected_at = utcnow()
     connection.status = "DISCONNECTED"
     connection.access_token_encrypted = None
     connection.refresh_token_encrypted = None
-    # A disconnected account can't be the one the app is scoped to. The partial unique index on
-    # is_selected only counts selected rows, so clearing this also frees the slot for another.
-    connection.is_selected = False
 
 
 async def purge_disconnected_connections(

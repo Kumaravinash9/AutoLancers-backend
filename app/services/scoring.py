@@ -54,11 +54,12 @@ def score_job(
         return ScoreResult(score=0.0, rejected=True, rejection_reason=rejection)
 
     reasons: list[dict[str, Any]] = []
+    config = profile.config
     weights = {
-        "skills": max(profile.weight_skills, 0.0),
-        "budget": max(profile.weight_budget, 0.0),
-        "competition": max(profile.weight_competition, 0.0),
-        "recency": max(profile.weight_recency, 0.0),
+        "skills": max(config.weight_skills, 0.0),
+        "budget": max(config.weight_budget, 0.0),
+        "competition": max(config.weight_competition, 0.0),
+        "recency": max(config.weight_recency, 0.0),
     }
     total_weight = sum(weights.values())
     if total_weight <= 0:
@@ -76,12 +77,12 @@ def score_job(
 
     score = round(earned / total_weight * 100, 1)
 
-    if score < profile.min_match_score:
+    if score < config.min_match_score:
         return ScoreResult(
             score=score,
             reasons=reasons,
             rejected=True,
-            rejection_reason=f"Scored {score}, below your minimum of {profile.min_match_score}.",
+            rejection_reason=f"Scored {score}, below your minimum of {config.min_match_score}.",
         )
 
     return ScoreResult(score=score, reasons=reasons)
@@ -101,11 +102,12 @@ def hard_reject_reason(job: JobPosting, profile: FreelancerProfile) -> str | Non
 
 
 def _hard_filter(job: JobPosting, profile: FreelancerProfile, haystack: str) -> str | None:
-    for term in profile.keywords_exclude or []:
+    config = profile.config
+    for term in config.keywords_exclude or []:
         if term and _contains_term(haystack, term):
             return f"Excluded keyword: {term!r}"
 
-    includes = [t for t in (profile.keywords_include or []) if t]
+    includes = [t for t in (config.keywords_include or []) if t]
     if includes and not any(_contains_term(haystack, t) for t in includes):
         return f"No required keyword present (need one of: {', '.join(includes)})"
 
@@ -282,7 +284,7 @@ def _score_competition(
     # Decay is hyperbolic rather than linear so it never bottoms out: a 30-bid job and a 300-bid
     # job have to be distinguishable, which subtraction against a cap cannot do once both are
     # past it. ``crowded_at_bids`` is the count that scores half marks.
-    reference = profile.crowded_at_bids or 25
+    reference = profile.config.crowded_at_bids or 25
     fraction = reference / (reference + job.bid_count)
     earned = weight * fraction
     reasons.append(

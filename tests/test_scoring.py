@@ -7,14 +7,37 @@ import datetime as dt
 import pytest
 
 from app.connectors.freelancer import JobPosting, normalize_project
-from app.db.models import FreelancerProfile
+from app.db.models import FreelancerProfile, ProfileConfig
 from app.services.matching import SkillMatch
 from app.services.scoring import score_job
 
 NOW = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.UTC)
 
+# Scoring knobs live on ProfileConfig now; the rest on the profile. make_profile splits overrides
+# between them so tests can keep passing e.g. weight_skills=90 as a flat kwarg.
+_CONFIG_KEYS = {
+    "keywords_include",
+    "keywords_exclude",
+    "crowded_at_bids",
+    "min_match_score",
+    "weight_skills",
+    "weight_budget",
+    "weight_competition",
+    "weight_recency",
+}
+
 
 def make_profile(**overrides) -> FreelancerProfile:
+    config = dict(
+        keywords_include=[],
+        keywords_exclude=["equity only", "unpaid"],
+        crowded_at_bids=25,
+        min_match_score=55.0,
+        weight_skills=60.0,
+        weight_budget=20.0,
+        weight_competition=10.0,
+        weight_recency=10.0,
+    )
     defaults = dict(
         display_name="InnoAI Labs",
         headline="AI systems, backends and client-owned websites",
@@ -24,21 +47,16 @@ def make_profile(**overrides) -> FreelancerProfile:
             {"name": "python", "weight": 4},
             {"name": "go", "weight": 1},
         ],
-        keywords_include=[],
-        keywords_exclude=["equity only", "unpaid"],
         fixed_project_min=500.0,
         rate_min=25.0,
         currency="USD",
-        crowded_at_bids=25,
-        min_match_score=55.0,
-        weight_skills=60.0,
-        weight_budget=20.0,
-        weight_competition=10.0,
-        weight_recency=10.0,
         proposal_notes="",
     )
-    defaults.update(overrides)
-    return FreelancerProfile(**defaults)
+    for key, value in overrides.items():
+        (config if key in _CONFIG_KEYS else defaults)[key] = value
+    profile = FreelancerProfile(**defaults)
+    profile.config = ProfileConfig(**config)
+    return profile
 
 
 def make_job(**overrides) -> JobPosting:
@@ -198,7 +216,7 @@ class TestScoring:
         )
         result = score_job(job, profile, now=NOW)
         skills_points = next(r["points"] for r in result.reasons if r["label"] == "Skills matched")
-        assert skills_points >= profile.weight_skills * 0.9
+        assert skills_points >= profile.config.weight_skills * 0.9
 
     def test_all_zero_weights_is_rejected_not_a_crash(self):
         profile = make_profile(
@@ -235,7 +253,7 @@ class TestSemanticSkillMatch:
         points = next(
             r["points"] for r in semantic.reasons if r["label"] == "Skills matched (semantic)"
         )
-        assert points == pytest.approx(profile.weight_skills)
+        assert points == pytest.approx(profile.config.weight_skills)
         assert semantic.score > substring.score
 
     def test_semantic_score_is_a_fraction_of_the_skills_weight(self):
@@ -246,7 +264,7 @@ class TestSemanticSkillMatch:
         points = next(
             r["points"] for r in result.reasons if r["label"] == "Skills matched (semantic)"
         )
-        assert points == pytest.approx(profile.weight_skills * 0.5)
+        assert points == pytest.approx(profile.config.weight_skills * 0.5)
 
     def test_reason_falls_back_when_the_model_gives_none(self):
         result = score_job(

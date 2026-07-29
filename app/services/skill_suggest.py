@@ -28,7 +28,7 @@ from dataclasses import dataclass
 import httpx
 
 from app.config import get_settings
-from app.db.models import FreelancerProfile, PlatformConnection
+from app.db.models import FreelancerProfile
 from app.services.llm import LLMError, complete_json
 
 logger = logging.getLogger(__name__)
@@ -125,7 +125,6 @@ class SkillSuggestion:
 
 async def suggest_skills(
     profile: FreelancerProfile,
-    connections: list[PlatformConnection],
     proposal_texts: list[str],
 ) -> list[SkillSuggestion]:
     """Propose skills the evidence supports but ``profile.skills`` omits.
@@ -135,7 +134,7 @@ async def suggest_skills(
     silently returning nothing.
     """
     settings = get_settings()
-    message = _build_user_message(profile, connections, proposal_texts)
+    message = _build_user_message(profile, proposal_texts)
 
     if settings.llm_provider == "gemini":
         if not settings.gemini_api_key:
@@ -288,19 +287,14 @@ def _finalise(raw: list[dict], already_listed: list[dict]) -> list[SkillSuggesti
 
 def _build_user_message(
     profile: FreelancerProfile,
-    connections: list[PlatformConnection],
     proposal_texts: list[str],
 ) -> str:
     listed = ", ".join(s["name"] for s in (profile.skills or []) if s.get("name"))
 
-    # Merge the evidence that lives on the marketplace accounts. The freelancer's own profile text
-    # and the account's public text often say different, complementary things.
-    account_skills = sorted(
-        {s for c in connections for s in (c.account_skills or []) if s}
-    )
-    account_text = _first_nonempty(
-        [c.summary for c in connections] + [c.tagline for c in connections]
-    )
+    # The marketplace-mirrored evidence now lives on the profile itself. The freelancer's own
+    # profile text and the account's public text often say different, complementary things.
+    account_skills = sorted({s for s in (profile.account_skills or []) if s})
+    account_text = _first_nonempty([profile.summary, profile.tagline])
 
     lines = [
         "<already_listed_skills>",

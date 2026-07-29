@@ -161,15 +161,176 @@ whether you won — nothing else in the system can know it.
 An unrecognised award status falls back to `SUBMITTED`, never `REJECTED`. Freelancer can add states
 at any time, and guessing "rejected" would invent losses and skew every figure built on top.
 
+## Captures from the browser extension
+
+Upwork has no usable discovery API, so postings from there arrive because a person opened a page and
+clicked. Four endpoints take them, all under `/ingest` and all requiring a bearer token from
+`POST /accounts/tokens`:
+
+| Endpoint | Takes | Writes |
+|---|---|---|
+| `POST /ingest/posting` | one job, read off its own page | `projects` + `recommendations` |
+| `POST /ingest/collection` | one whole listing page | `projects` + `recommendations`, or `page_captures` for pages with no modelled table |
+| `POST /ingest/profile` | your own marketplace profile | `platform_connections` + the mirrored half of `freelancer_profiles` |
+| `POST /ingest/parse` | visible page text, for the LLM reader | nothing — returns fields |
+| `GET /ingest/status` | — | nothing — reports whether the extension can still read each marketplace |
+
+Everything captured is stored with `discovery_method = PASTE_IN`, distinct from the poller's
+`API_POLL`, so "where did this come from?" always has a true answer.
+
+### Collections
+
+`/ingest/collection` takes a page as the extension's selectors found it — `budget` as the string
+`"$500.00 - $1,000.00"`, `posted` as `"3 hours ago"` — and `app/services/capture.py` parses that into
+columns. One parser on this side, rather than two that drift.
+
+```bash
+curl -s localhost:8010/ingest/collection \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{
+    "freelance_platform": "upwork",
+    "page_key": "best_matches",
+    "reads": "jobs",
+    "scraped_at": "2026-07-30T12:00:00Z",
+    "is_llm_required": false,
+    "items": [{"external_id": "~021999", "url": "https://www.upwork.com/jobs/~021999",
+               "title": "Next.js dashboard build", "description": "…",
+               "budget": "$1,500.00 - $3,000.00", "proposals": 11,
+               "posted": "2 hours ago", "skills": ["Next.js"]}]
+  }' | jq
+```
+
+Every job-listing page maps onto the same table. Best matches and Most recent are not two kinds of
+thing; both are `projects`, deduped on `(platform, external_id)` — so a posting on both pages is one
+row scored once, and the page it was seen on is recorded in `bid_information.source_page` rather than
+in the identity of the row. Sixty jobs is one request and one transaction.
+
+Three things worth knowing about the shape:
+
+- **`work_type` is lowercase** — `"hourly"` / `"fixed"`. `services.scoring._budget_floor` compares
+  against those literals, so an uppercase value picks no floor at all and every job passes the budget
+  filter. The column comment says `FIXED | HOURLY`; the code is the authority.
+- **A field the scraper didn't find arrives as `null`**, never as zero, and a partial capture never
+  blanks a value an earlier one found. Scoring skips a filter it has no input for, so a missing budget
+  means "unknown" rather than "free".
+- **`content_hash` is the same fingerprint the poller uses.** A posting seen first by a cycle and
+  later by hand must hash identically, or every hand-captured sighting would report itself as an edit.
+
+### The LLM reader
+
+`is_llm_required: true` asks for a reading of `page_text` to fill what the selectors missed. It is a
+request, not an instruction — the call is skipped when nothing is actually missing, and the response
+reports `llm_used`, `llm_model`, `llm_fields_filled` and `llm_unmatched` so an enrichment that quietly
+did nothing is distinguishable from one that filled fourteen fields. A model that is unreachable costs
+the enrichment and not the page: the scraped rows still store, and `llm_error` says what happened.
+
+Two rules make that safe:
+
+1. **Fill, never overwrite.** Only fields already empty, and only keys in `capture.LLM_FILLABLE` — an
+   allowlist, so a new key in the schema can't quietly start writing to a column nobody reviewed.
+2. **No invented projects.** Readings are matched back to scraped rows by **title**: a job's id lives
+   in its link's `href`, and the model only ever sees visible text. An item no row matches is dropped
+   and counted, because with no id there is nothing to dedupe the next capture against.
+
+### Session status — `GET /ingest/status`
+
+The failure with no symptom: signed out of Upwork, the extension reads a login page that loads
+perfectly, finds no jobs, and files an honest-looking zero. Nothing errors, so nothing else in the
+system can tell anyone — while the board keeps serving yesterday's scores as though they were current.
+
+Every captured page now carries `page_status` (`ok` | `signed_out` | `blocked`), recorded in
+`capture_statuses` as one row per user per platform. `GET /ingest/status` serves it back for the
+frontend to render a banner:
+
+```json
+[{"platform": "upwork", "status": "SIGNED_OUT",
+  "detail": "Not signed in to Upwork — redirected to the login page.",
+  "page_key": "best_matches", "since": "2026-07-30T09:14:02Z",
+  "last_checked_at": "2026-07-30T11:02:44Z", "last_ok_at": "2026-07-29T18:20:10Z"}]
+```
+
+`since` is when it first went wrong and `last_checked_at` is the most recent attempt — "signed out for
+three days" and "signed out just now" need different words, and one timestamp cannot say both. A
+successful capture clears the row rather than appending to it, so this is state and not a log.
+`last_ok_at: null` means the extension has never read that marketplace, which the UI must not call
+"expired". An empty list means it has never reported in at all — nobody has looked.
+
+A page reporting a wall stores nothing: a login page holds no jobs, and its text is not your
+contracts. The status *was* the point of the request.
+
+### Only your own profile — `POST /ingest/profile`
+
+This endpoint mirrors what it is sent onto **your** `freelancer_profiles` row, which every score in
+the app is computed from. No URL pattern can tell your Upwork profile from anyone else's —
+`/freelancers/~01…` matches every freelancer on the site — so before the `is_own` gate, opening a
+competitor's profile in the extension and clicking Send replaced your display name, tagline, rate and
+skills with theirs.
+
+The extension decides by comparing the account id in the URL against the id the marketplace's **own
+account menu** links to, and sends the verdict. A `false` is refused with a 409; so is a `null`, which
+means the extension could not tell. "Probably yours" is not a good enough reason to overwrite that
+row — and `null` is also what an older extension build sends, so it fails closed.
+
+### Accumulated captures
+
+Contracts, proposals, orders and message-room lists have no modelled table yet — a proposal needs a
+resolved project FK, a contract needs a table of its own. But those rows exist only while a person is
+on the page, so deferring the decision *and* discarding the data would throw away a month of history.
+`/ingest/collection` keeps them whole in **`page_captures`** instead:
+
+```sql
+select page_key, item_count, times_seen, parsed_model, last_seen_at
+from page_captures where user_id = '…' order by last_seen_at desc;
+
+-- the rows themselves
+select jsonb_pretty(items) from page_captures where page_key = 'contracts';
+```
+
+`items` is the reader's output untouched and `page_text` is what a person saw — between them, v2 can
+extract whatever shape it settles on. Unique on `(user_id, platform, page_key, content_hash)`: an
+unchanged re-collection bumps `times_seen` and `last_seen_at`, while a changed page is a new row.
+The hash is over `items` only, not the text, so a marketplace swapping a promo strip doesn't file a
+new row every visit.
+
+Owned by a `user_id`, unlike `projects` — a posting is public and shared, your contracts and your
+inbox are not.
+
+With `is_llm_required`, `PARSE_KIND_BY_PAGE` maps the page onto a `proposals` or `contracts` schema and
+the reading lands in `parsed`, **beside** the raw rows rather than in place of them: a model's
+interpretation is not evidence, and a later prompt should get to re-read the original. Message rooms
+are absent from that map on purpose — two-party data, half of it belonging to someone who never agreed
+to any of this, so it accumulates but is never sent to a model.
+
 ## Tests
 
 ```bash
-uv run pytest                      # 67 tests, no database or network needed
+uv run pytest                      # 170 tests, no database or network needed
 uv run ruff check app tests
 ```
 
 The suite is pure logic — scoring, drafting failure modes, award mapping, identity mapping. There
 is no database fixture, so route-level behaviour is verified by hand against a running server.
+
+## Inspecting the database
+
+Connect with `psql` (install it via the `postgresql` client package for your OS — e.g. `brew
+install libpq` on macOS, `apt-get install postgresql-client` on Debian/Ubuntu):
+
+```bash
+psql "postgresql://postgres:postgres@localhost:5434/automatelancers"
+```
+
+Once you're in, the meta-commands worth knowing:
+
+| Command | What it does |
+|---|---|
+| `\dt` | List tables in the current schema — this is the one you want for checking your tables |
+| `\d tablename` | Show a specific table's columns, types and indexes |
+| `\dt+` | List tables with sizes and descriptions |
+| `\l` (or `\list`) | List all databases |
+| `\dn` | List schemas |
+
+Note `\dl` is **not** "list tables" — it's `\lo_list`, listing large objects. For tables use `\dt`;
+for databases use `\l`.
 
 ## Schema changes
 
