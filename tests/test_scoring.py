@@ -268,7 +268,10 @@ class TestSemanticSkillMatch:
 
     def test_reason_falls_back_when_the_model_gives_none(self):
         result = score_job(
-            make_job(), make_profile(), now=NOW, skill_match=SkillMatch(score=0.8, matched=["react"])
+            make_job(),
+            make_profile(),
+            now=NOW,
+            skill_match=SkillMatch(score=0.8, matched=["react"]),
         )
         detail = next(
             r["detail"] for r in result.reasons if r["label"] == "Skills matched (semantic)"
@@ -276,7 +279,8 @@ class TestSemanticSkillMatch:
         assert detail == "react"
 
     def test_no_skills_ignores_the_match(self):
-        """With no skills the component is zero regardless of a supplied match — nothing to credit."""
+        """With no skills the component is zero regardless of a supplied match — nothing to
+        credit."""
         profile = make_profile(skills=[])
         result = score_job(
             make_job(), profile, now=NOW, skill_match=SkillMatch(score=1.0, reason="x")

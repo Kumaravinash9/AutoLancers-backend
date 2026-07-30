@@ -112,6 +112,21 @@ async def current_user(
     return user
 
 
+async def optional_user(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> User | None:
+    """The signed-in user if there is one, or ``None`` — never a 401.
+
+    For the one endpoint that may run unauthenticated while testing. It resolves a credential when
+    one is offered, so a request that *does* carry one is still attributed to its owner; it simply
+    does not insist. Whether anonymous is allowed at all is the caller's decision, not this one's.
+    """
+    try:
+        return await current_user(request, session)
+    except HTTPException:
+        return None
+
+
 async def require_admin(user: User = Depends(current_user)) -> User:
     """Admin-only routes depend on this. 404, not 403, so the portal isn't discoverable."""
     if not user.is_admin:

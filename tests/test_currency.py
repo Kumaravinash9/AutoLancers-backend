@@ -15,7 +15,8 @@ class TestConvert:
         assert convert(500, " usd ", "Usd") == 500
 
     def test_converts_across_currencies_via_usd(self):
-        # 12,500 INR at ~0.012 USD is ~150 USD — well under a 500 USD floor, the bug's canonical case.
+        # 12,500 INR at ~0.012 USD is ~150 USD — well under a 500 USD floor, the bug's
+        # canonical case.
         usd = convert(12_500, "INR", "USD")
         assert usd is not None
         assert 100 < usd < 200

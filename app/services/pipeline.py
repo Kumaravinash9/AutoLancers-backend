@@ -420,7 +420,9 @@ async def _ingest(
             skill_match = await match_skills(posting, profile)
         except MatchingError as exc:
             # A failed call must not stop ingest — scoring falls back to substring matching.
-            logger.warning("Skill match failed for %s, using substring: %s", posting.external_id, exc)
+            logger.warning(
+                "Skill match failed for %s, using substring: %s", posting.external_id, exc
+            )
             skill_match = None
         # Only cache a genuine verdict. A budget-deferred job never reaches here, so it stays a
         # cache miss and gets another turn on a later cycle.

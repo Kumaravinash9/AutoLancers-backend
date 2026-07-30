@@ -8,7 +8,9 @@ lets anyone later ask "where did this come from?" and get a true answer.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +25,8 @@ from app.api.schemas import (
     PageParseIn,
     PageParseOut,
 )
-from app.auth.accounts import current_user
+from app.auth.accounts import current_user, optional_user
+from app.config import get_settings
 from app.connectors import ConnectorKind
 from app.connectors.freelancer import JobPosting
 from app.db.models import (
@@ -47,6 +50,8 @@ from app.services.users import (
     get_or_create_profile,
     get_or_create_profile_for_connection,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -447,14 +452,30 @@ async def capture_status(
 @router.post("/parse", response_model=PageParseOut)
 async def parse(
     payload: PageParseIn,
-    user: User = Depends(current_user),
+    user: User | None = Depends(optional_user),
 ) -> PageParseOut:
-    """Read a page with an LLM when the selectors come back empty.
+    """Read a page with an LLM when the selectors come back empty. Writes nothing.
 
     Deliberately a separate endpoint rather than an automatic fallback inside capture: this costs
     money and seconds per call, so it happens because someone chose it, not because a selector
-    quietly broke.
+    quietly broke. It is the extension's "Read with AI" button — you see what the model made of the
+    page before deciding whether to store anything.
+
+    Authentication is optional while ``PARSE_REQUIRES_AUTH`` is false, so that button works before
+    anyone has issued themselves a token. That is a testing convenience and nothing more: this calls
+    a paid model, so left open on a reachable host it is an unmetered proxy to your LLM quota. Turn
+    it on before exposing this service.
     """
+    settings = get_settings()
+    if settings.parse_requires_auth and user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not signed in.")
+    if user is None:
+        # Logged per request, not once at startup: the line that matters is the one beside the
+        # request it allowed, in whatever log someone is actually reading.
+        logger.warning(
+            "Anonymous /ingest/parse — allowed because PARSE_REQUIRES_AUTH is false. "
+            "This endpoint calls a paid model; set it to true before exposing this service."
+        )
     try:
         result = await parse_page(payload.kind, payload.text)
     except PageParseError as exc:

@@ -120,7 +120,12 @@ class SkillSuggestion:
     source: str
 
     def as_dict(self) -> dict[str, object]:
-        return {"name": self.name, "weight": self.weight, "reason": self.reason, "source": self.source}
+        return {
+            "name": self.name,
+            "weight": self.weight,
+            "reason": self.reason,
+            "source": self.source,
+        }
 
 
 async def suggest_skills(
@@ -189,7 +194,9 @@ async def _suggest_with_gemini(message: str) -> list[dict]:
 
     if response.status_code >= 400:
         # The key rides in the query string, so keep it out of the error text.
-        raise SkillSuggestError(f"Gemini API returned {response.status_code}: {response.text[:300]}")
+        raise SkillSuggestError(
+            f"Gemini API returned {response.status_code}: {response.text[:300]}"
+        )
 
     data = response.json()
     candidates = data.get("candidates") or []
@@ -328,7 +335,11 @@ def _join_entries(entries: list[dict] | None) -> str:
     parts: list[str] = []
     for entry in entries or []:
         if isinstance(entry, dict):
-            fields = [str(v) for v in entry.values() if isinstance(v, str | int | float) and str(v).strip()]
+            fields = [
+                str(v)
+                for v in entry.values()
+                if isinstance(v, str | int | float) and str(v).strip()
+            ]
             if fields:
                 parts.append(" — ".join(fields))
         elif isinstance(entry, str) and entry.strip():

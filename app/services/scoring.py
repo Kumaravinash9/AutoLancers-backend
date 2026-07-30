@@ -244,7 +244,8 @@ def _score_budget(
         reasons.append(
             {
                 "label": "Budget currency unknown",
-                "detail": f"Listed up to {job.budget_max:.0f} {currency}; can't compare to your floor",
+                "detail": f"Listed up to {job.budget_max:.0f} {currency}; can't compare "
+                "to your floor",
                 "points": round(earned, 1),
             }
         )
@@ -256,7 +257,8 @@ def _score_budget(
     reasons.append(
         {
             "label": "Budget fit",
-            "detail": f"Up to {job.budget_max:.0f} {currency} against your floor of {floor:.0f} {profile.currency}",
+            "detail": f"Up to {job.budget_max:.0f} {currency} against your floor of "
+            f"{floor:.0f} {profile.currency}",
             "points": round(earned, 1),
         }
     )

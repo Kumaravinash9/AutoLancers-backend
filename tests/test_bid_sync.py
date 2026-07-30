@@ -107,7 +107,11 @@ class TestHomeMirror:
     def test_populates_a_fresh_profile(self):
         profile = FreelancerProfile()
         self._mirror(
-            {"id": 1, "primary_currency": {"code": "INR"}, "location": {"country": {"name": "India"}}},
+            {
+                "id": 1,
+                "primary_currency": {"code": "INR"},
+                "location": {"country": {"name": "India"}},
+            },
             profile,
         )
         assert profile.country == "India"
@@ -117,7 +121,11 @@ class TestHomeMirror:
         # The freelancer entered a 500 floor — its currency is theirs to change, not the sync's.
         profile = FreelancerProfile(fixed_project_min=500.0, currency="USD")
         self._mirror(
-            {"id": 1, "primary_currency": {"code": "INR"}, "location": {"country": {"name": "India"}}},
+            {
+                "id": 1,
+                "primary_currency": {"code": "INR"},
+                "location": {"country": {"name": "India"}},
+            },
             profile,
         )
         assert profile.currency == "USD"  # respected
