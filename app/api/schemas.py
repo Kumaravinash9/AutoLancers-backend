@@ -478,6 +478,12 @@ class CapturedPosting(BaseModel):
     experience_level: str | None = None
     project_length: str | None = None
 
+    # Ask the LLM to read the raw page and fill any field the selectors missed (see /ingest/parse).
+    # Costs a model call, so it's opt-in: the extension sets it when it wants accuracy over speed,
+    # and sends the visible page text for the model to read.
+    is_llm_required: bool = False
+    page_text: str | None = Field(default=None, max_length=200_000)
+
 
 class CapturedPage(BaseModel):
     """One page the extension finished reading, sent as its selectors found it.
@@ -589,12 +595,25 @@ class CaptureResult(BaseModel):
     rejection_reason: str | None
     reasons: list[dict[str, Any]]
 
+    # Whether the LLM was asked to read the page, which model answered, how many fields it filled,
+    # and — distinct from "not used" — whether it was asked but failed.
+    llm_used: bool = False
+    llm_model: str | None = None
+    llm_fields_filled: int = 0
+    llm_error: str | None = None
+
 
 class CapturedProfile(BaseModel):
     """Your own marketplace profile, read off your profile page."""
 
     platform: str = Field(default="upwork", max_length=50)
     username: str = Field(min_length=1, max_length=255)
+
+    # The account's stable marketplace id, read from the profile URL (Upwork's ~01… cipher id, a
+    # numeric id elsewhere). This — not the mutable username — is the account's identity: it keys
+    # the connection and lines up with the id OAuth stores, so one real account is one connection.
+    # Optional so an older extension that only sends the handle still works (username is fallback).
+    account_id: str | None = Field(default=None, max_length=255)
 
     # Whether the extension confirmed this is the *signed-in user's own* profile, by comparing the
     # account id in the URL against the id the marketplace's own header links to.
@@ -611,6 +630,11 @@ class CapturedProfile(BaseModel):
     hourly_rate: float | None = None
     currency: str | None = None
     country: str | None = None
+
+    # Ask the LLM to read the raw profile page and fill any field the selectors missed. Opt-in and
+    # costs a model call — the extension sets it and sends the page text when accuracy matters most.
+    is_llm_required: bool = False
+    page_text: str | None = Field(default=None, max_length=200_000)
     avatar_url: str | None = None
     rating: float | None = None
     total_reviews: int | None = None

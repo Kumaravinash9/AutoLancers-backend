@@ -38,9 +38,11 @@ from app.db.models import (
 from app.db.session import get_session
 from app.services.capture import (
     PARSE_KIND_BY_PAGE,
+    CapturedItem,
     dedupe,
     item_from_card,
     match_llm_items,
+    merge_llm_fields,
     record_session,
     store_capture,
     store_posting,
@@ -78,10 +80,9 @@ async def capture_posting(
     # than one never recorded, because its silence reads as "fine".
     await record_session(session, user.id, payload.platform, "ok", page_key="job_page")
 
-    stored = await store_posting(
-        session,
-        profile,
-        JobPosting(
+    scraped_at = payload.posted_at or utcnow()
+    item = CapturedItem(
+        posting=JobPosting(
             platform=payload.platform,
             external_id=payload.external_id,
             title=payload.title,
@@ -95,7 +96,7 @@ async def capture_posting(
             bid_count=payload.proposal_count,
             posted_at=payload.posted_at,
         ),
-        client=payload.client.columns() if payload.client else None,
+        client=payload.client.columns() if payload.client else {},
         bid_information={
             "experience_level": payload.experience_level,
             "project_length": payload.project_length,
@@ -107,6 +108,31 @@ async def capture_posting(
             "description_complete": bool(payload.description),
             "source_page": "job_page",
         },
+        gaps=[],
+    )
+
+    # Read the page with the LLM when asked, filling only what the selectors missed. Routed through
+    # the one page-reading entry point (``parse_page``); a model failure costs the enrichment, not
+    # the capture — the posting is still stored and scored, and the response says the read failed.
+    llm_used = False
+    llm_model: str | None = None
+    llm_filled = 0
+    llm_error: str | None = None
+    if payload.is_llm_required and payload.page_text:
+        try:
+            parsed = await parse_page("job", payload.page_text)
+            llm_used = True
+            llm_model = parsed.get("model")
+            llm_filled = merge_llm_fields(item, parsed.get("fields") or {}, scraped_at)
+        except PageParseError as exc:
+            llm_error = str(exc)
+
+    stored = await store_posting(
+        session,
+        profile,
+        item.posting,
+        client=item.client or None,
+        bid_information=item.bid_information,
     )
     await session.commit()
 
@@ -118,6 +144,10 @@ async def capture_posting(
         rejected=stored.result.rejected,
         rejection_reason=stored.result.rejection_reason,
         reasons=stored.result.reasons,
+        llm_used=llm_used,
+        llm_model=llm_model,
+        llm_fields_filled=llm_filled,
+        llm_error=llm_error,
     )
 
 
@@ -334,6 +364,37 @@ async def _accumulate(
     )
 
 
+def _fill_profile_gaps(payload: CapturedProfile, fields: dict) -> None:
+    """Fill only the blank fields on a captured profile from an LLM reading.
+
+    Selectors win where they got a value; the model supplies what they missed — the same
+    fill-gaps policy the job paths use, so a reading can't override a value already scraped.
+    """
+
+    def text(key: str) -> str | None:
+        v = fields.get(key)
+        return v.strip() if isinstance(v, str) and v.strip() else None
+
+    def num(key: str) -> float | None:
+        v = fields.get(key)
+        return float(v) if isinstance(v, int | float) and not isinstance(v, bool) else None
+
+    payload.display_name = payload.display_name or text("display_name")
+    payload.tagline = payload.tagline or text("tagline")
+    payload.summary = payload.summary or text("summary")
+    payload.currency = payload.currency or text("currency")
+    payload.country = payload.country or text("country")
+    if not payload.skills:
+        payload.skills = [x for x in (fields.get("skills") or []) if isinstance(x, str)]
+    if payload.hourly_rate is None:
+        payload.hourly_rate = num("hourly_rate")
+    if payload.rating is None:
+        payload.rating = num("rating")
+    if payload.total_reviews is None:
+        reviews = num("total_reviews")
+        payload.total_reviews = int(reviews) if reviews is not None else None
+
+
 @router.post("/profile", response_model=dict)
 async def capture_profile(
     payload: CapturedProfile,
@@ -372,19 +433,39 @@ async def capture_profile(
             ),
         )
 
+    # Read the page with the LLM when asked, filling only the fields the selectors missed. Same one
+    # entry point (``parse_page``) the job paths use; a model failure costs the enrichment, not the
+    # capture — the fields the selectors did get are still stored.
+    llm_used = False
+    llm_model: str | None = None
+    llm_error: str | None = None
+    if payload.is_llm_required and payload.page_text:
+        try:
+            parsed = await parse_page("profile", payload.page_text)
+            fields = parsed.get("fields") or {}
+            llm_used = True
+            llm_model = parsed.get("model")
+            _fill_profile_gaps(payload, fields)
+        except PageParseError as exc:
+            llm_error = str(exc)
+
+    # Key on the account's stable id, not its handle: a rename would otherwise spawn a duplicate
+    # connection, and this is the same id OAuth stores — so an account connected both ways
+    # reconciles to one row. Falls back to the username for older extensions that don't send an id.
+    account_id = payload.account_id or payload.username
     connection = await session.scalar(
         select(PlatformConnection).where(
             PlatformConnection.user_id == user.id,
             PlatformConnection.platform == payload.platform,
-            PlatformConnection.platform_username == payload.username,
+            PlatformConnection.platform_user_id == account_id,
         )
     )
     if connection is None:
         connection = PlatformConnection(
             user_id=user.id,
             platform=payload.platform,
+            platform_user_id=account_id,
             platform_username=payload.username,
-            platform_user_id=payload.username,
             status="ACTIVE",
             # Captured by the browser extension, not OAuth — a read-only mirror with no tokens.
             kind=ConnectorKind.EXTENSION,
@@ -394,6 +475,9 @@ async def capture_profile(
         )
         session.add(connection)
         await session.flush()  # needs an id before a profile can link to it
+    else:
+        # Keep the display handle current — it's the mutable field; the id is what we matched on.
+        connection.platform_username = payload.username
 
     profile = await get_or_create_profile_for_connection(session, connection)
 
@@ -420,6 +504,9 @@ async def capture_profile(
         "connection_id": str(connection.id),
         "profile_id": str(profile.id),
         "skills": len(payload.skills),
+        "llm_used": llm_used,
+        "llm_model": llm_model,
+        "llm_error": llm_error,
     }
 
 
