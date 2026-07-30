@@ -8,11 +8,13 @@ specific connection — happens here so no caller has to know the rule.
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.connectors import ConnectorKind
 from app.db.models import (
     FreelancerProfile,
     PlatformConnection,
@@ -20,6 +22,8 @@ from app.db.models import (
     Role,
     User,
 )
+
+logger = logging.getLogger(__name__)
 
 # Used by the CLI scripts and the poller, which run without a signed-in request.
 DEFAULT_USER_EMAIL = "owner@localhost"
@@ -118,3 +122,64 @@ async def get_or_create_profile_for_connection(
     await session.commit()
     await session.refresh(profile)
     return profile
+
+
+async def get_or_create_extension_connection(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    platform: str,
+    account_id: str,
+    username: str | None = None,
+) -> PlatformConnection:
+    """The connection for one extension-captured account, keyed on its stable id.
+
+    Keyed on ``platform_user_id`` (the account's real id), not the handle: a rename can't spawn a
+    duplicate, and this is the same field OAuth stores — so an account connected both ways is one
+    row. Creates a token-less :data:`ConnectorKind.EXTENSION` row when the account is new.
+    """
+    connection = await session.scalar(
+        select(PlatformConnection).where(
+            PlatformConnection.user_id == user_id,
+            PlatformConnection.platform == platform,
+            PlatformConnection.platform_user_id == account_id,
+        )
+    )
+    if connection is None:
+        connection = PlatformConnection(
+            user_id=user_id,
+            platform=platform,
+            platform_user_id=account_id,
+            platform_username=username,
+            status="ACTIVE",
+            kind=ConnectorKind.EXTENSION,
+            scope=None,
+        )
+        session.add(connection)
+        await session.flush()  # needs an id before a profile can link to it
+    elif username:
+        # Keep the display handle current — it's the mutable field; the id is what we matched on.
+        connection.platform_username = username
+    return connection
+
+
+async def get_or_create_profile_for_account(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    platform: str,
+    account_id: str | None,
+) -> FreelancerProfile:
+    """The profile a capture should attribute to: the account it came from, else the selected one.
+
+    A capture that names its account (``account_id``) scores against *that* account's profile, even
+    when several are connected. Without one — an older extension — it falls back to the selected
+    profile, so nothing breaks; the fallback is logged because a silent misattribution is the bug
+    this exists to prevent.
+    """
+    if not account_id:
+        logger.info(
+            "Capture on %s carried no account id — attributing to the selected profile.", platform
+        )
+        return await get_or_create_profile(session, user_id)
+
+    connection = await get_or_create_extension_connection(session, user_id, platform, account_id)
+    return await get_or_create_profile_for_connection(session, connection)

@@ -461,6 +461,9 @@ class CapturedPosting(BaseModel):
     """
 
     platform: str = Field(default="upwork", max_length=50)
+    # The signed-in account this page was read under (its stable marketplace id). Attributes the
+    # capture to that account's profile; falls back to the selected profile when absent.
+    account_id: str | None = Field(default=None, max_length=255)
     external_id: str = Field(min_length=1, max_length=200)
     url: str = Field(max_length=1000)
     title: str = Field(min_length=1, max_length=500)
@@ -496,6 +499,9 @@ class CapturedPage(BaseModel):
     # Named for what it is rather than reusing ``platform``: this is the marketplace the pages were
     # read from, and the extension speaks in those terms throughout.
     freelance_platform: str = Field(max_length=50)
+    # The signed-in account this page was read under (its stable marketplace id). Attributes the
+    # captured jobs to that account's profile; falls back to the selected profile when absent.
+    account_id: str | None = Field(default=None, max_length=255)
     page_key: str = Field(max_length=100)
     page_label: str = Field(default="", max_length=200)
     # Which reader ran, which is what decides how ``items`` is shaped. Mirrors the ``reads``

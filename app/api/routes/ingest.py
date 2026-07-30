@@ -27,11 +27,9 @@ from app.api.schemas import (
 )
 from app.auth.accounts import current_user, optional_user
 from app.config import get_settings
-from app.connectors import ConnectorKind
 from app.connectors.freelancer import JobPosting
 from app.db.models import (
     CaptureStatus,
-    PlatformConnection,
     User,
     utcnow,
 )
@@ -49,7 +47,8 @@ from app.services.capture import (
 )
 from app.services.page_parse import PageParseError, parse_page
 from app.services.users import (
-    get_or_create_profile,
+    get_or_create_extension_connection,
+    get_or_create_profile_for_account,
     get_or_create_profile_for_connection,
 )
 
@@ -72,7 +71,10 @@ async def capture_posting(
     Shares its upsert with the collection endpoint below, via ``services.capture.store_posting``, so
     the same job stores identically whether it arrived from its own page or from a listing.
     """
-    profile = await get_or_create_profile(session, user.id)
+    # Attribute to the account the page was read under, not just whichever profile is selected.
+    profile = await get_or_create_profile_for_account(
+        session, user.id, payload.platform, payload.account_id
+    )
 
     # Recorded here too, not only on the collection path. A single job read while signed out is the
     # same news as a whole run read while signed out, and reporting it from one path only meant the
@@ -208,7 +210,10 @@ async def capture_collection(
     if payload.reads != "jobs":
         return await _accumulate(payload, user, session, scraped_at, recorded.status)
 
-    profile = await get_or_create_profile(session, user.id)
+    # Attribute the page's jobs to the account it was read under, not just the selected profile.
+    profile = await get_or_create_profile_for_account(
+        session, user.id, payload.freelance_platform, payload.account_id
+    )
 
     items = []
     skipped_no_id = 0
@@ -450,35 +455,15 @@ async def capture_profile(
             llm_error = str(exc)
 
     # Key on the account's stable id, not its handle: a rename would otherwise spawn a duplicate
-    # connection, and this is the same id OAuth stores — so an account connected both ways
-    # reconciles to one row. Falls back to the username for older extensions that don't send an id.
-    account_id = payload.account_id or payload.username
-    connection = await session.scalar(
-        select(PlatformConnection).where(
-            PlatformConnection.user_id == user.id,
-            PlatformConnection.platform == payload.platform,
-            PlatformConnection.platform_user_id == account_id,
-        )
+    # connection, and this is the same id OAuth stores — so an account connected both ways is one
+    # row. Falls back to the username for older extensions that don't send an id.
+    connection = await get_or_create_extension_connection(
+        session,
+        user.id,
+        payload.platform,
+        payload.account_id or payload.username,
+        username=payload.username,
     )
-    if connection is None:
-        connection = PlatformConnection(
-            user_id=user.id,
-            platform=payload.platform,
-            platform_user_id=account_id,
-            platform_username=payload.username,
-            status="ACTIVE",
-            # Captured by the browser extension, not OAuth — a read-only mirror with no tokens.
-            kind=ConnectorKind.EXTENSION,
-            # No OAuth happened, so there is no scope to record. Saying "read only" here would
-            # imply a token exists.
-            scope=None,
-        )
-        session.add(connection)
-        await session.flush()  # needs an id before a profile can link to it
-    else:
-        # Keep the display handle current — it's the mutable field; the id is what we matched on.
-        connection.platform_username = payload.username
-
     profile = await get_or_create_profile_for_connection(session, connection)
 
     # display_name is non-null on the profile — only overwrite it when the capture actually carried
