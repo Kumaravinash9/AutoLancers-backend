@@ -67,6 +67,12 @@ async def capture_posting(
     """
     profile = await get_or_create_profile(session, user.id)
 
+    # Recorded here too, not only on the collection path. A single job read while signed out is the
+    # same news as a whole run read while signed out, and reporting it from one path only meant the
+    # app's banner stayed silent for the other two — and a status recorded only sometimes is worse
+    # than one never recorded, because its silence reads as "fine".
+    await record_session(session, user.id, payload.platform, "ok", page_key="job_page")
+
     stored = await store_posting(
         session,
         profile,
@@ -345,6 +351,10 @@ async def capture_profile(
     like a ``False``: "probably yours" is not a good enough reason to overwrite the row that every
     score in the app is computed from.
     """
+    # Before the guard: reaching a profile page at all proves the session works, and that is worth
+    # recording even when the profile turns out not to be yours.
+    await record_session(session, user.id, payload.platform, "ok", page_key="profile_page")
+
     if payload.is_own is not True:
         raise HTTPException(
             status_code=409,
