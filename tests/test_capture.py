@@ -11,6 +11,7 @@ import datetime as dt
 
 from app.connectors.freelancer import JobPosting
 from app.services.capture import (
+    CARD_READABLE,
     PARSE_KIND_BY_PAGE,
     SESSION_STATUSES,
     capture_hash,
@@ -235,6 +236,38 @@ class TestMatchLlmItems:
         assert unmatched == 0
         assert filled == 1
 
+
+class TestTheCostGate:
+    """`gaps` decides whether a paid LLM call happens, so a gate that never closes is a bill.
+
+    It never closed. `client` was counted as missing from every job card — and no card produces a
+    client block, because a listing does not show one — so `any(gaps)` was always true and the model
+    ran on every listing page the toggle was on for. "Not shown here" is not "missing": a field the
+    page never displays is not evidence of a failed read, and paying a model to look for it finds
+    nothing either.
+    """
+
+    def test_a_complete_card_asks_for_nothing(self):
+        item = item_from_card("upwork", card(budget="Hourly: $30.00-$50.00"), NOW)
+        assert item.gaps == []
+
+    def test_a_card_missing_a_field_does_ask(self):
+        assert "skills" in item_from_card("upwork", card(skills=[]), NOW).gaps
+        assert "description" in item_from_card("upwork", card(description=""), NOW).gaps
+
+    def test_the_client_block_is_not_a_card_gap(self):
+        # A card never carries one. Counting it made the gate permanently open.
+        assert "client" not in CARD_READABLE
+        assert "client" not in item_from_card("upwork", card(budget="Hourly: $30/hr"), NOW).gaps
+
+    def test_a_fill_can_close_the_gate(self):
+        item = item_from_card("upwork", card(budget=None, skills=[]), NOW)
+        assert item.gaps
+        merge_llm_fields(item, {"min_budget": 800, "max_budget": 900, "work_type": "fixed",
+                                "required_skills": ["Django"]}, NOW)
+        # Recomputed against the same yardstick, or a completed item would still look incomplete and
+        # the next page would pay again for nothing.
+        assert item.gaps == []
 
 class TestCaptureHash:
     """The fingerprint for pages kept whole — contracts, proposals, orders, room lists."""

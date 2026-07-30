@@ -236,9 +236,29 @@ _GAP_FIELDS = (
 )
 
 
-def _gaps_of(posting: JobPosting, client: dict[str, Any]) -> list[str]:
-    missing = [name for name, attr in _GAP_FIELDS if not getattr(posting, attr, None)]
-    if not any(client.get(key) for key in ("client_name", "client_country", "client_rating")):
+# What a listing card can show, and therefore what counts as missing from one. A card carries the
+# posting; it does not carry the client's history — that is on the job's own page, which the
+# optional per-job pass already opens.
+#
+# The distinction matters because these names gate a paid call. Counting `client` as missing from a
+# card made it *permanently* missing: no card produces one, so `any(gaps)` was always true and the
+# LLM fired on every listing page the toggle was on for. A gate that never closes is not a gate.
+CARD_READABLE = frozenset({"description", "work_type", "min_budget", "posted_at", "skills"})
+
+
+def _gaps_of(
+    posting: JobPosting, client: dict[str, Any], readable: frozenset[str] | None = None
+) -> list[str]:
+    """Which interesting fields came back empty *and* could have been read from this kind of page.
+
+    "Not shown here" is not "missing". A field the page never displays is not evidence of a failed
+    read, and treating it as one buys an LLM call that cannot find it either.
+    """
+    names = [name for name, attr in _GAP_FIELDS if not getattr(posting, attr, None)]
+    missing = [name for name in names if readable is None or name in readable]
+    if (readable is None or "client" in readable) and not any(
+        client.get(key) for key in ("client_name", "client_country", "client_rating")
+    ):
         missing.append("client")
     return missing
 
@@ -295,7 +315,7 @@ def item_from_card(
         posting=posting,
         client=client,
         bid_information=bid_information,
-        gaps=_gaps_of(posting, client),
+        gaps=_gaps_of(posting, client, CARD_READABLE),
     )
 
 
@@ -394,7 +414,7 @@ def merge_llm_fields(item: CapturedItem, fields: dict[str, Any], scraped_at: dt.
                 item.bid_information[key] = value
                 filled += 1
 
-    item.gaps = _gaps_of(posting, item.client)
+    item.gaps = _gaps_of(posting, item.client, CARD_READABLE)
     return filled
 
 
