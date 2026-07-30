@@ -7,25 +7,23 @@
 # To actually *require* their approval, turn on "Require review from Code Owners" in the branch
 # protection rule / ruleset for the protected branch (main, and develop if you protect it too).
 # Owners must have write access to the repo for their review to count.
-#
-# Replace @Kumaravinash9 with a team (e.g. @your-org/backend) once there's more than one maintainer.
 
 # Default owner for everything not matched more specifically below.
-*                           @Kumaravinash9
+*                           @Kumaravinash9 @aviralJain101
 
 # --- schema & data: the riskiest surface here ------------------------------------------------
 # Migrations have broken this project before (see README) — every change wants a careful eye.
-/alembic/                   @Kumaravinash9
-/app/db/models.py           @Kumaravinash9
+/alembic/                   @Kumaravinash9 @aviralJain101
+/app/db/models.py           @Kumaravinash9 @aviralJain101
 
 # --- CI, ownership, and repo config ----------------------------------------------------------
 # Whoever can change the gates (workflows, this file) effectively controls what "green" means.
-/.github/                   @Kumaravinash9
+/.github/                   @Kumaravinash9 @aviralJain101
 
 # --- external integrations & core logic ------------------------------------------------------
-/app/connectors/            @Kumaravinash9
-/app/services/scoring.py    @Kumaravinash9
-/app/services/pipeline.py   @Kumaravinash9
+/app/connectors/            @Kumaravinash9 @aviralJain101
+/app/services/scoring.py    @Kumaravinash9 @aviralJain101
+/app/services/pipeline.py   @Kumaravinash9 @aviralJain101
 
 # --- auth & secrets-adjacent code ------------------------------------------------------------
-/app/auth/                  @Kumaravinash9
+/app/auth/                  @Kumaravinash9 @aviralJain101
