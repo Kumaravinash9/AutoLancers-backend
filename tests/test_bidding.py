@@ -45,7 +45,7 @@ def no_network(monkeypatch):
         async def submit_bid(self, **kw):
             raise AssertionError("submitted a bid despite a closed gate")
 
-    monkeypatch.setattr(bidding, "FreelancerClient", _Exploding)
+    monkeypatch.setattr(bidding, "create_connector", lambda *a, **kw: _Exploding())
     return built
 
 
@@ -216,7 +216,7 @@ class TestRecording:
                 assert kw["milestone_percentage"] == 100
                 return "55501"
 
-        monkeypatch.setattr(bidding, "FreelancerClient", _Client)
+        monkeypatch.setattr(bidding, "create_connector", lambda *a, **kw: _Client())
         monkeypatch.setattr(bidding, "get_valid_access_token", _fake_token)
 
         job = make_job()

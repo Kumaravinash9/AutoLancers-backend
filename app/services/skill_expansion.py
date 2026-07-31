@@ -51,8 +51,8 @@ _SYSTEM_PROMPT = (
     "- Include adjacent and umbrella tags a client would realistically use (e.g. 'Next.js' -> "
     "'React.js', 'JavaScript', 'Web Development', 'Full Stack Development'; 'FastAPI' -> 'Python', "
     "'API Development', 'Backend Development').\n"
-    "- Stay within what this freelancer could plausibly deliver — widen the vocabulary, don't cross "
-    "into unrelated fields (a web developer is not a 'Video Editing' tag).\n"
+    "- Stay within what this freelancer could plausibly deliver — widen the vocabulary, "
+    "don't cross into unrelated fields (a web developer is not a 'Video Editing' tag).\n"
     "- Use canonical marketplace tag names, not vague phrases.\n"
     "- It is fine to be generous: this only decides which jobs are fetched, not how they are "
     "scored.\n"
@@ -145,7 +145,9 @@ async def _expand_with_gemini(message: str) -> list[str]:
 
     if response.status_code >= 400:
         # The key rides in the query string, so keep it out of the error text.
-        raise SkillExpansionError(f"Gemini API returned {response.status_code}: {response.text[:300]}")
+        raise SkillExpansionError(
+            f"Gemini API returned {response.status_code}: {response.text[:300]}"
+        )
 
     data = response.json()
     candidates = data.get("candidates") or []

@@ -57,6 +57,61 @@ def _validate_password(password: str) -> None:
         raise AuthError("Password is too long (72 bytes maximum).")
 
 
+# Which audience a token was minted for. A session token carries none; an extension token says so,
+# and each is refused where the other belongs. Without this the two are the same string in different
+# places — an extension token would work as a web session, and a stolen one would be a full account.
+EXTENSION_AUDIENCE = "extension"
+
+# Short, because the app re-issues on every sync and the extension has no way to refresh on its own.
+# Long enough that a collection started at the end of one cannot outlive it.
+EXTENSION_TTL_HOURS = 12
+
+
+def create_extension_token(user: User) -> tuple[str, dt.datetime]:
+    """A JWT for the browser extension, minted by the app on the user's behalf.
+
+    The extension cannot obtain a credential itself: it runs on Upwork's origin, where this app's
+    session cookie is never sent. The app can, and hands this over.
+
+    A separate token rather than the session cookie's own, for two reasons worth more than the
+    convenience of reusing it. The session stays ``httponly`` and never becomes readable by
+    JavaScript, so an XSS bug still cannot lift it. And this one carries ``aud``, so it is refused
+    as a web session — a token taken off a machine reads pages, it does not become you.
+
+    It carries ``sub``, which is the point for identity: the extension can tell whose token it holds
+    without asking anyone, so a browser that switched users cannot quietly file one person's jobs
+    into another's account.
+    """
+    settings = get_settings()
+    if not settings.jwt_secret:
+        raise AuthError("JWT_SECRET is not set — cannot issue extension tokens.")
+
+    now = utcnow()
+    expires = now + dt.timedelta(hours=EXTENSION_TTL_HOURS)
+    payload = {
+        "sub": str(user.id),
+        "role": user.role,
+        "aud": EXTENSION_AUDIENCE,
+        "iat": now,
+        "exp": expires,
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM), expires
+
+
+def decode_extension_token(token: str) -> dict:
+    """Verify an extension token. Refuses anything not minted for that audience."""
+    settings = get_settings()
+    try:
+        return jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=[ALGORITHM],
+            audience=EXTENSION_AUDIENCE,
+        )
+    except jwt.PyJWTError as exc:
+        raise AuthError("Extension token is invalid or expired.") from exc
+
+
 def create_session_token(user: User) -> str:
     settings = get_settings()
     if not settings.jwt_secret:
@@ -75,9 +130,21 @@ def create_session_token(user: User) -> str:
 def decode_session_token(token: str) -> dict:
     settings = get_settings()
     try:
-        return jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=[ALGORITHM],
+            # A session carries no audience. Saying so explicitly is what stops an extension token
+            # being replayed as one: both are signed with the same key, so without this check the
+            # separation would hold in one direction only, which is not a separation.
+            options={"verify_aud": False},
+        )
     except jwt.PyJWTError as exc:
         raise AuthError("Session is invalid or expired.") from exc
+
+    if payload.get("aud"):
+        raise AuthError("That token is not a session.")
+    return payload
 
 
 async def current_user(
@@ -90,12 +157,29 @@ async def current_user(
     """
     # A bearer token first: the Chrome extension runs on Upwork's origin and never carries our
     # session cookie. Both are first-class credentials; neither is a fallback for the other.
+    #
+    # Two shapes are accepted. A stored API token, revocable and unexpiring; and an extension JWT,
+    # which the app mints on the user's behalf and which carries its own identity and expiry. The
+    # JWT is tried second so a stored token is never spent on a signature check.
     header = request.headers.get("authorization") or ""
     if header.lower().startswith("bearer "):
-        holder = await api_tokens.resolve(session, header[7:].strip())
-        if holder is None:
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or revoked API token.")
-        return holder
+        presented = header[7:].strip()
+
+        holder = await api_tokens.resolve(session, presented)
+        if holder is not None:
+            return holder
+
+        try:
+            payload = decode_extension_token(presented)
+        except AuthError as exc:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+
+        # Re-read rather than trust the claim, for the same reason the cookie path does: a
+        # deactivated account must stop working now, not when its token happens to expire.
+        user = await session.get(User, uuid.UUID(payload["sub"]))
+        if user is None or not user.is_active:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account is not active.")
+        return user
 
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
@@ -110,6 +194,21 @@ async def current_user(
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account is not active.")
     return user
+
+
+async def optional_user(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> User | None:
+    """The signed-in user if there is one, or ``None`` — never a 401.
+
+    For the one endpoint that may run unauthenticated while testing. It resolves a credential when
+    one is offered, so a request that *does* carry one is still attributed to its owner; it simply
+    does not insist. Whether anonymous is allowed at all is the caller's decision, not this one's.
+    """
+    try:
+        return await current_user(request, session)
+    except HTTPException:
+        return None
 
 
 async def require_admin(user: User = Depends(current_user)) -> User:

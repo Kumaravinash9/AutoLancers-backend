@@ -1,0 +1,68 @@
+name: Merge checks
+
+# Runs after a merge to main (a push to the branch). Everything the PR gate does, plus the one
+# thing the DB-less PR tests can't catch: that the migration chain applies cleanly on an empty
+# database and leaves the schema exactly matching the models (`alembic check`). The README notes
+# migrations have broken this project before — a NOT NULL added to a populated table, etc. — so
+# this is where that class of bug is caught before it reaches a real database.
+on:
+  push:
+    branches: [main, ]
+
+concurrency:
+  group: main-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Lint, test & migrations
+    runs-on: ubuntu-latest
+
+    # A real Postgres to migrate against — the same major version the app targets (README: 16).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: automatelancers
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Async driver — alembic/env.py drives migrations through the app's own async engine. Not a
+      # secret: it points at the ephemeral Postgres service below, whose throwaway creds are literal.
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/automatelancers
+      # Key material comes from repo/environment secrets, never the workflow file. Add them under
+      # Settings → Secrets and variables → Actions. TOKEN_ENCRYPTION_KEY must be a valid Fernet key.
+      TOKEN_ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run ruff check app tests
+
+      - name: Tests
+        run: uv run pytest -q
+
+      - name: Apply migrations on a clean database
+        run: uv run alembic upgrade head
+
+      - name: Assert the schema matches the models
+        run: uv run alembic check
