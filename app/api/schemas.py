@@ -488,6 +488,18 @@ class CapturedPosting(BaseModel):
     page_text: str | None = Field(default=None, max_length=200_000)
 
 
+class CapturedPostings(BaseModel):
+    """Several job pages read one at a time, sent together.
+
+    The deep pass opens each job's own page for the description a listing truncates — one page load
+    per job. Holding all of them until the pass finished meant a run cancelled at job 28 of 31 filed
+    nothing at all, every page load spent and no record of it. Batching flushes the work as it is
+    done, so what has been read stays read.
+    """
+
+    postings: list[CapturedPosting] = Field(default_factory=list, max_length=200)
+
+
 class CapturedPage(BaseModel):
     """One page the extension finished reading, sent as its selectors found it.
 
@@ -644,6 +656,21 @@ class CapturedProfile(BaseModel):
     avatar_url: str | None = None
     rating: float | None = None
     total_reviews: int | None = None
+
+
+class ExtensionToken(BaseModel):
+    """A JWT the app mints for the browser extension, plus who it is for.
+
+    ``user_id`` matters as much as the token. The extension holds one credential at a time, and a
+    browser where a second person signed in afterwards would otherwise keep the first one's — filing
+    one user's marketplace data into another's account, with a progress bar and no error. Returning
+    the identity is what lets the caller check before it starts rather than discover afterwards.
+    """
+
+    token: str
+    user_id: uuid.UUID
+    email: str
+    expires_at: dt.datetime
 
 
 class ApiTokenOut(BaseModel):

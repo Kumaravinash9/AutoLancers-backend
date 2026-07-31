@@ -19,6 +19,7 @@ from app.api.schemas import (
     CapturedPage,
     CapturedPageResult,
     CapturedPosting,
+    CapturedPostings,
     CapturedProfile,
     CaptureResult,
     CaptureStatusOut,
@@ -150,6 +151,99 @@ async def capture_posting(
         llm_model=llm_model,
         llm_fields_filled=llm_filled,
         llm_error=llm_error,
+    )
+
+
+@router.post("/postings", response_model=CapturedPageResult)
+async def capture_postings(
+    payload: CapturedPostings,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> CapturedPageResult:
+    """Store a batch of job pages, each read on its own.
+
+    The same upsert as one posting, run over several in one transaction — a batch of ten is one
+    round trip and one commit rather than ten of each. It exists because the deep pass reads jobs
+    one at a time and used to hold every result until it had finished them all: a run stopped
+    partway through filed nothing, having spent the page loads anyway.
+
+    Attributed to the account the batch was read under, resolved once. Every posting in a batch
+    comes from the same run on the same marketplace account, so resolving per item would repeat one
+    lookup — and a batch that somehow mixed accounts is a bug worth failing on, not one to split
+    quietly.
+    """
+    if not payload.postings:
+        return CapturedPageResult(
+            freelance_platform="unknown", page_key="job_pages", reads="jobs",
+            received=0, stored=0, created=0, updated=0,
+        )
+
+    first = payload.postings[0]
+    profile = await get_or_create_profile_for_account(
+        session, user.id, first.platform, first.account_id
+    )
+    await record_session(session, user.id, first.platform, "ok", page_key="job_pages")
+
+    results: list[CapturedItemResult] = []
+    created = 0
+    for posting in payload.postings:
+        stored = await store_posting(
+            session,
+            profile,
+            JobPosting(
+                platform=posting.platform,
+                external_id=posting.external_id,
+                title=posting.title,
+                description=posting.description,
+                url=posting.url,
+                skills_listed=posting.skills,
+                budget_type=posting.work_type,
+                budget_min=posting.budget_min,
+                budget_max=posting.budget_max,
+                currency=posting.currency,
+                bid_count=posting.proposal_count,
+                posted_at=posting.posted_at,
+            ),
+            client=posting.client.columns() if posting.client else None,
+            bid_information={
+                "experience_level": posting.experience_level,
+                "project_length": posting.project_length,
+                "client_total_spent": posting.client.total_spent if posting.client else None,
+                "client_payment_verified": (
+                    posting.client.payment_verified if posting.client else None
+                ),
+                # Read from the job's own page, so the description is the whole brief rather than
+                # the preview a listing card shows.
+                "description_complete": bool(posting.description),
+                "source_page": "job_page",
+            },
+        )
+        created += 1 if stored.created else 0
+        results.append(
+            CapturedItemResult(
+                external_id=posting.external_id,
+                title=posting.title,
+                project_id=stored.project.id,
+                created=stored.created,
+                score=stored.result.score,
+                rejected=stored.result.rejected,
+                rejection_reason=stored.result.rejection_reason,
+            )
+        )
+
+    # One commit for the batch. A per-item commit would leave a half-written batch behind on a
+    # failure, and the whole point of batching is that the work already done survives.
+    await session.commit()
+
+    return CapturedPageResult(
+        freelance_platform=first.platform,
+        page_key="job_pages",
+        reads="jobs",
+        received=len(payload.postings),
+        stored=len(results),
+        created=created,
+        updated=len(results) - created,
+        items=results,
     )
 
 

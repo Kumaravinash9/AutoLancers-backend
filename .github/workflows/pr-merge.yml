@@ -7,7 +7,7 @@ name: Merge checks
 # this is where that class of bug is caught before it reaches a real database.
 on:
   push:
-    branches: [main]
+    branches: [main, ]
 
 concurrency:
   group: main-${{ github.ref }}
