@@ -1,0 +1,64 @@
+{
+  "summary": "AI & Backend Engineer with 4+ years of experience designing scalable AI-powered platforms, distributed systems, and cloud-native backend infrastructure. Specialized in RAG, computer vision, vector databases, workflow orchestration, and platform engineering. Experience includes Google, eBay, Deutsche Bank, InMobi, and Blinkit, building production systems at enterprise scale.",
+  "account_skills": [
+    "Backend Development",
+    "Distributed Systems",
+    "RAG",
+    "Computer Vision",
+    "Vector Databases",
+    "Workflow Orchestration",
+    "Platform Engineering",
+    "Spring Boot",
+    "SQL",
+    "Redis",
+    "Google Cloud Platform",
+    "Apache Airflow",
+    "Flutter"
+  ],
+  "portfolio": [
+    {
+      "title": "Multi-vendor inventory platform",
+      "description": "Built a FastAPI backend with PostgreSQL, Redis queues, REST APIs, and a React dashboard for stock management."
+    },
+    {
+      "title": "Shopify fulfilment integration",
+      "description": "Created a Python service that synchronises Shopify orders with a warehouse system and reports failures in a Next.js admin portal."
+    }
+  ],
+  "reviews": [
+    {
+      "rating": 5,
+      "feedback": "Delivered a reliable Python API and PostgreSQL database design. Clear communication and excellent deployment support."
+    },
+    {
+      "rating": 5,
+      "feedback": "The React dashboard and Shopify integration work exactly as requested."
+    }
+  ],
+  "experience": [
+    {
+      "title": "Senior Software Developer",
+      "company": "eBay",
+      "location": "Bengaluru, India",
+      "period": "Jun 2026 - Present",
+      "description": "Working as an AI & Backend Engineer, building and scaling core preference and profile infrastructure serving 134M+ active users, enabling seamless cross-platform continuity across Android, iOS, and Web. Engineered high-throughput, low-latency pipelines to generate and serve profile embeddings for downstream ML models, enabling predictive personalization and improving user experience at scale."
+    },
+    {
+      "title": "Software Developer-2",
+      "company": "InMobi",
+      "location": "Bengaluru, India",
+      "period": "Jun 2025 - May 2026",
+      "description": "Worked as a Backend Engineer, building scalable systems to improve developer workflows, system observability, and reliability across high-scale distributed services. Designed and optimized backend services powering CI/CD pipelines handling 5K+ builds/day, 8K+ deployments/day, and 2M+ metrics/day, improving throughput, fault tolerance, and system reliability."
+    },
+    {
+      "title": "Software Developer-2",
+      "company": "Deutsche Bank",
+      "description": "Engineered scalable cloud backend systems using Spring Boot, SQL, Redis, and GCP. Architected a distributed job scheduler that purged 14M records in 6 hours, boosting resource efficiency. Reduced duplicate API requests by 35% and improved lead response time by 25% via Redis TTL idempotency and Pub/Sub. Built GCP Dataflow and Airflow pipelines cutting BigQuery ingestion time by 40%. Delivered 120+ days on-call and raised test coverage from 5% to 95%."
+    },
+    {
+      "title": "Software Developer Intern",
+      "company": "Google / Google Summer of Code (Retroshare)",
+      "description": "Contributed to a decentralized Flutter-based chat application, implementing secure peer-to-peer messaging with platform channels and event-driven architecture."
+    }
+  ]
+}

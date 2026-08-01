@@ -30,9 +30,20 @@ Analyse one freelancer's profile evidence and return two weighted lists:
 - Use concise canonical marketplace skill names for recommendations (for example, `React.js`,
   `PostgreSQL`, or `REST API`).
 
+# Client-review priority
+- Give explicit, skill-specific client-review evidence more weight than a self-authored summary,
+  a listed skill, or one unsupported portfolio claim. A review only supports a skill when it names
+  the skill, a closely identifiable deliverable, or a concrete outcome of that skill.
+- Do not use generic praise such as "great work", "excellent freelancer", or "good communication"
+  as evidence for a technical skill.
+- A skill explicitly supported by a client review should receive at least weight 4. Use weight 5
+  when multiple reviews support it, or when a review is reinforced by substantial portfolio or
+  experience evidence.
+
 # Weight scale
-- 5: a core, repeatedly demonstrated strength.
-- 4: a strong, clearly demonstrated capability.
+- 5: a core, repeatedly demonstrated strength; multiple client reviews or a client review plus
+  substantial project/experience evidence normally merits this.
+- 4: a strong, clearly demonstrated capability; an explicit client review normally merits this.
 - 3: regular, directly supported experience.
 - 2: limited but credible evidence.
 - 1: listed but weakly supported, incidental, or not otherwise evidenced.
@@ -41,7 +52,6 @@ Analyse one freelancer's profile evidence and return two weighted lists:
 - Return every distinct `account_skills` item exactly once in `existing_skills`, even if its
   weight is 1.
 - Return only high-confidence additions in `recommended_skills`; an empty list is valid.
-- Give every item a short reason that cites concrete supplied evidence.
 - `evidence_sources` must be a non-empty subset of: `summary`, `account_skills`, `portfolio`,
   `reviews`, `experience`. Recommended skills must include at least one source other than
   `account_skills`.
@@ -58,7 +68,6 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "name": {"type": "string"},
                     "weight": {"type": "integer"},
-                    "reason": {"type": "string"},
                     "evidence_sources": {
                         "type": "array",
                         "items": {
@@ -73,7 +82,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                         },
                     },
                 },
-                "required": ["name", "weight", "reason", "evidence_sources"],
+                "required": ["name", "weight", "evidence_sources"],
                 "additionalProperties": False,
             },
         },
@@ -84,7 +93,6 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "name": {"type": "string"},
                     "weight": {"type": "integer"},
-                    "reason": {"type": "string"},
                     "evidence_sources": {
                         "type": "array",
                         "items": {
@@ -99,7 +107,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                         },
                     },
                 },
-                "required": ["name", "weight", "reason", "evidence_sources"],
+                "required": ["name", "weight", "evidence_sources"],
                 "additionalProperties": False,
             },
         },

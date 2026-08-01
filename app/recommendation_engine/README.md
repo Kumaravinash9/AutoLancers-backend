@@ -42,3 +42,22 @@ The engine uses the existing `LLM_PROVIDER` configuration (`gemini`, `anthropic`
 requests schema-constrained JSON. It also validates the result locally: existing skills cannot be
 dropped, weights are clamped to 1–5, duplicates are removed, and unsupported recommendations are
 discarded.
+
+Explicit, skill-specific client reviews are the strongest evidence type. The prompt directs the
+LLM to assign such a skill at least weight 4. Generic praise does not count as technical-skill
+evidence.
+
+## Run it
+
+From the repository root, run the bundled demo with one command:
+
+```bash
+uv run python scripts/run_recommendation_engine.py
+```
+
+It loads `demo_profile.json` by default and prints the weighted skills and new recommendations as
+JSON with skill names, weights, and evidence sources. To use another evidence file, pass its path:
+
+```bash
+uv run python scripts/run_recommendation_engine.py --input path/to/profile.json
+```

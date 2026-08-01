@@ -67,9 +67,8 @@ def finalise_recommendation(
     """Enforce list membership, de-duplication, evidence requirements, and weight bounds.
 
     An LLM cannot be allowed to silently drop one of the user's existing skills.  A missing item is
-    retained with the lowest weight, which accurately communicates that its evidence was weak or
-    that the provider failed to assess it.  Suggestions without a concrete reason and a source
-    beyond the account's own skill list are discarded.
+    retained with the lowest weight. Suggestions without a source beyond the account's own skill
+    list are discarded.
     """
     listed = _unique_names(account_skills)
     raw_existing = _index_by_skill(raw.get("existing_skills"))
@@ -80,9 +79,6 @@ def finalise_recommendation(
             _to_weighted_skill(
                 item,
                 fallback_name=name,
-                fallback_reason=(
-                    "Listed on the marketplace profile; no additional evidence was returned."
-                ),
                 fallback_sources=("account_skills",),
             )
         )
@@ -98,11 +94,10 @@ def finalise_recommendation(
         skill = _to_weighted_skill(
             item,
             fallback_name=name,
-            fallback_reason="",
             fallback_sources=(),
         )
         has_external_evidence = set(skill.evidence_sources).intersection(_RECOMMENDATION_SOURCES)
-        if not skill.reason or not has_external_evidence:
+        if not has_external_evidence:
             continue
         seen.add(key)
         recommended.append(skill)
@@ -136,20 +131,20 @@ def _to_weighted_skill(
     item: Mapping[str, Any] | None,
     *,
     fallback_name: str,
-    fallback_reason: str,
     fallback_sources: tuple[str, ...],
 ) -> WeightedSkill:
     if item is None:
-        return WeightedSkill(fallback_name, 1, fallback_reason, fallback_sources)
+        return WeightedSkill(fallback_name, 1, fallback_sources)
+    sources = _sources(item.get("evidence_sources")) or fallback_sources
     return WeightedSkill(
         name=fallback_name,
         weight=_weight(item.get("weight")),
-        reason=str(item.get("reason") or "").strip() or fallback_reason,
-        evidence_sources=_sources(item.get("evidence_sources")) or fallback_sources,
+        evidence_sources=sources,
     )
 
 
 def _weight(value: object) -> int:
+    """Clamp the LLM's weight to the supported 1–5 range."""
     try:
         return max(1, min(5, int(value)))
     except (TypeError, ValueError):

@@ -36,7 +36,10 @@ class TestPrompt:
         ):
             assert value in prompt
         assert "untrusted data" in SYSTEM_PROMPT
+        assert "at least weight 4" in SYSTEM_PROMPT
         assert set(RESPONSE_SCHEMA["properties"]) == {"existing_skills", "recommended_skills"}
+        skill_schema = RESPONSE_SCHEMA["properties"]["existing_skills"]["items"]
+        assert "reason" not in skill_schema["properties"]
 
 
 class TestFinalise:
@@ -47,7 +50,6 @@ class TestFinalise:
                     {
                         "name": "react js",
                         "weight": 7,
-                        "reason": "Several React portfolio projects.",
                         "evidence_sources": ["portfolio"],
                     }
                 ],
@@ -59,6 +61,22 @@ class TestFinalise:
         assert [skill.weight for skill in result.existing_skills] == [5, 1]
         assert result.existing_skills[1].evidence_sources == ("account_skills",)
 
+    def test_review_evidence_does_not_override_the_llm_weight(self):
+        result = finalise_recommendation(
+            {
+                "existing_skills": [
+                    {
+                        "name": "Redis",
+                        "weight": 1,
+                        "evidence_sources": ["reviews"],
+                    }
+                ],
+                "recommended_skills": [],
+            },
+            ["Redis"],
+        )
+        assert result.existing_skills[0].weight == 1
+
     def test_filters_duplicates_and_recommendations_without_real_evidence(self):
         result = finalise_recommendation(
             {
@@ -67,19 +85,16 @@ class TestFinalise:
                     {
                         "name": "node js",
                         "weight": 5,
-                        "reason": "It appears in the listed skills.",
                         "evidence_sources": ["account_skills"],
                     },
                     {
                         "name": "PostgreSQL",
                         "weight": 4,
-                        "reason": "Database design is described in a portfolio project.",
                         "evidence_sources": ["portfolio"],
                     },
                     {
                         "name": "postgresql",
                         "weight": 2,
-                        "reason": "Repeated.",
                         "evidence_sources": ["experience"],
                     },
                 ],
@@ -97,7 +112,6 @@ class TestFinalise:
                     {
                         "name": "C#",
                         "weight": 3,
-                        "reason": "C# application is in the portfolio.",
                         "evidence_sources": ["portfolio"],
                     }
                 ],
@@ -118,7 +132,6 @@ class TestEngine:
                     {
                         "name": "Python",
                         "weight": 5,
-                        "reason": "Core language in experience.",
                         "evidence_sources": ["experience"],
                     }
                 ],
@@ -126,7 +139,6 @@ class TestEngine:
                     {
                         "name": "FastAPI",
                         "weight": 4,
-                        "reason": "Portfolio describes FastAPI services.",
                         "evidence_sources": ["portfolio"],
                     }
                 ],
@@ -147,6 +159,7 @@ class TestEngine:
         assert "FastAPI service" in received["prompt"]
         assert result.existing_skills[0].weight == 5
         assert [skill.name for skill in result.recommended_skills] == ["FastAPI"]
+        assert "reason" not in result.as_dict()["recommended_skills"][0]
 
     def test_converts_provider_failure_to_engine_failure(self):
         async def failing_completion(*_args):

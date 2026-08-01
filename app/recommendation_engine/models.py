@@ -67,18 +67,16 @@ class ProfileEvidence:
 
 @dataclass(frozen=True)
 class WeightedSkill:
-    """One weighted skill, including the evidence that made its weight trustworthy."""
+    """One weighted skill and the profile sections that support it."""
 
     name: str
     weight: int  # 1 (peripheral) through 5 (core strength)
-    reason: str
     evidence_sources: tuple[str, ...]
 
     def as_dict(self) -> dict[str, object]:
         return {
             "name": self.name,
             "weight": self.weight,
-            "reason": self.reason,
             "evidence_sources": list(self.evidence_sources),
         }
 
