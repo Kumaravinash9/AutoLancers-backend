@@ -62,10 +62,6 @@ def _validate_password(password: str) -> None:
 # places — an extension token would work as a web session, and a stolen one would be a full account.
 EXTENSION_AUDIENCE = "extension"
 
-# Short, because the app re-issues on every sync and the extension has no way to refresh on its own.
-# Long enough that a collection started at the end of one cannot outlive it.
-EXTENSION_TTL_HOURS = 12
-
 
 def create_extension_token(user: User) -> tuple[str, dt.datetime]:
     """A JWT for the browser extension, minted by the app on the user's behalf.
@@ -87,7 +83,7 @@ def create_extension_token(user: User) -> tuple[str, dt.datetime]:
         raise AuthError("JWT_SECRET is not set — cannot issue extension tokens.")
 
     now = utcnow()
-    expires = now + dt.timedelta(hours=EXTENSION_TTL_HOURS)
+    expires = now + dt.timedelta(hours=settings.extension_token_ttl_hours)
     payload = {
         "sub": str(user.id),
         "role": user.role,

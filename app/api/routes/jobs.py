@@ -13,7 +13,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import BidAvailabilityOut, BidRequest, BidResult, JobOut, JobPatch
+from app.auth.accounts import current_user
 from app.db.models import (
+    FreelancerProfile,
     PlatformConnection,
     Project,
     Proposal,
@@ -35,16 +37,19 @@ from app.services.bidding import (
 from app.services.currency import convert
 from app.services.drafting import DraftingError, draft_proposal
 from app.services.pipeline import rescore_all, to_posting
-from app.services.users import get_or_create_default_user, get_or_create_profile
+from app.services.users import get_or_create_profile
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
-async def _local_currency(session: AsyncSession, user: User | None = None) -> str | None:
+def _local_currency(profile: FreelancerProfile) -> str | None:
     """The freelancer's home currency for display, read from the profile — where sync mirrors it
     from the connected account's country. It's the same currency scoring floors use, so the
-    converted figure and the floor reasoning always agree."""
-    profile = await _profile_for(session, user)
+    converted figure and the floor reasoning always agree.
+
+    Takes the profile the caller already resolved: looking it up a second time in the same request
+    re-entered the get-or-create path, which on a brand-new account is the one that has to recover
+    from a losing insert."""
     return profile.currency
 
 
@@ -95,18 +100,9 @@ def _flatten(rec: Recommendation, local_currency: str | None = None) -> JobOut:
     )
 
 
-async def _profile_for(session: AsyncSession, user: User | None):
-    """The profile whose board we're reading.
-
-    Falls back to the default account so the poller and the CLI scripts keep working without a
-    signed-in request.
-    """
-    owner = user or await get_or_create_default_user(session)
-    return await get_or_create_profile(session, owner.id)
-
-
-async def _maybe_user(session: AsyncSession) -> User | None:
-    return None
+async def _profile_for(session: AsyncSession, user: User):
+    """The profile whose board we're reading — always the signed-in user's."""
+    return await get_or_create_profile(session, user.id)
 
 
 @router.get("", response_model=list[JobOut])
@@ -117,9 +113,10 @@ async def list_jobs(
     sort: str = Query(default="recent", pattern="^(recent|score)$"),
     limit: int = Query(default=50, le=200),
     offset: int = 0,
+    user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[JobOut]:
-    profile = await _profile_for(session, None)
+    profile = await _profile_for(session, user)
 
     query = select(Recommendation).where(Recommendation.freelancer_id == profile.id)
     if status is not None:
@@ -143,21 +140,24 @@ async def list_jobs(
 
     query = query.limit(limit).offset(offset)
     rows = (await session.scalars(query)).unique().all()
-    local = await _local_currency(session)
+    local = _local_currency(profile)
     return [_flatten(rec, local) for rec in rows]
 
 
 @router.post("/rescore")
-async def rescore(session: AsyncSession = Depends(get_session)) -> dict[str, int]:
+async def rescore(
+    user: User = Depends(current_user), session: AsyncSession = Depends(get_session)
+) -> dict[str, int]:
     """Re-run scoring over every stored recommendation — call after changing the profile."""
-    profile = await _profile_for(session, None)
+    profile = await _profile_for(session, user)
     return {"rescored": await rescore_all(session, profile)}
 
 
 @router.get("/bid-availability", response_model=BidAvailabilityOut)
-async def bid_availability(session: AsyncSession = Depends(get_session)) -> BidAvailability:
+async def bid_availability(
+    user: User = Depends(current_user), session: AsyncSession = Depends(get_session)
+) -> BidAvailability:
     """Whether bidding is usable, and if not why — so the UI can explain, not just grey out."""
-    user = await get_or_create_default_user(session)
     connection = await session.scalar(
         select(PlatformConnection).where(
             PlatformConnection.user_id == user.id,
@@ -169,8 +169,12 @@ async def bid_availability(session: AsyncSession = Depends(get_session)) -> BidA
 
 
 @router.get("/{job_id}", response_model=JobOut)
-async def get_job(job_id: uuid.UUID, session: AsyncSession = Depends(get_session)) -> JobOut:
-    rec = await _owned(session, job_id)
+async def get_job(
+    job_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> JobOut:
+    rec = await _owned(session, job_id, user)
     # Opening it is reading it: clear the change flag and stop calling it NEW.
     if rec.status == RecommendationStatus.NEW or rec.has_changes:
         rec.status = (
@@ -183,11 +187,13 @@ async def get_job(job_id: uuid.UUID, session: AsyncSession = Depends(get_session
 
 @router.post("/{job_id}/bid", response_model=BidResult)
 async def place_bid(
-    job_id: uuid.UUID, request: BidRequest, session: AsyncSession = Depends(get_session)
+    job_id: uuid.UUID,
+    request: BidRequest,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> BidResult:
     """Place a real bid. The only path in this codebase that submits anything."""
-    user = await get_or_create_default_user(session)
-    rec = await _owned(session, job_id)
+    rec = await _owned(session, job_id, user)
 
     try:
         bid_id = await submit_bid_for_recommendation(
@@ -208,9 +214,12 @@ async def place_bid(
 
 @router.patch("/{job_id}", response_model=JobOut)
 async def patch_job(
-    job_id: uuid.UUID, patch: JobPatch, session: AsyncSession = Depends(get_session)
+    job_id: uuid.UUID,
+    patch: JobPatch,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> JobOut:
-    rec = await _owned(session, job_id)
+    rec = await _owned(session, job_id, user)
 
     if patch.proposal_text is not None:
         proposal = rec.proposal
@@ -235,8 +244,8 @@ async def patch_job(
     return _flatten(rec)
 
 
-async def _owned(session: AsyncSession, job_id: uuid.UUID) -> Recommendation:
-    profile = await _profile_for(session, None)
+async def _owned(session: AsyncSession, job_id: uuid.UUID, user: User) -> Recommendation:
+    profile = await _profile_for(session, user)
     rec = await session.scalar(
         select(Recommendation).where(
             Recommendation.id == job_id, Recommendation.freelancer_id == profile.id
@@ -252,15 +261,19 @@ STATUSES = [s.value for s in RecommendationStatus]
 
 
 @router.post("/{job_id}/draft", response_model=JobOut)
-async def draft(job_id: uuid.UUID, session: AsyncSession = Depends(get_session)) -> JobOut:
+async def draft(
+    job_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> JobOut:
     """Write a proposal for this job now, rather than waiting for the poller to reach it.
 
     The cycle only drafts the top few per run, so a job further down the board would otherwise
     never get one. Re-running replaces the current text and keeps the previous generation as a
     version, so regenerating is never destructive.
     """
-    rec = await _owned(session, job_id)
-    profile = await _profile_for(session, None)
+    rec = await _owned(session, job_id, user)
+    profile = await _profile_for(session, user)
 
     try:
         generated = await draft_proposal(to_posting(rec.project), profile)

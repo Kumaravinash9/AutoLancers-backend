@@ -30,6 +30,8 @@ from app.api.schemas import (
     SkillNamesIn,
     SkillsAcceptIn,
 )
+from app.auth.accounts import current_user
+from app.connectors import ConnectorKind
 from app.db.models import (
     FreelancerProfile,
     PlatformConnection,
@@ -49,7 +51,6 @@ from app.services.skill_suggest import (
     suggest_skills,
 )
 from app.services.users import (
-    get_or_create_default_user,
     get_or_create_profile,
     get_or_create_profile_for_connection,
 )
@@ -201,13 +202,14 @@ def _connection_out(
 
 
 @router.get("/profiles", response_model=list[ProfileCard])
-async def list_profiles(session: AsyncSession = Depends(get_session)) -> list[ProfileCard]:
+async def list_profiles(
+    user: User = Depends(current_user), session: AsyncSession = Depends(get_session)
+) -> list[ProfileCard]:
     """Every profile on this account — one per connected marketplace account.
 
     Selected first, then oldest, so the account switcher has a stable order and the scoped account
     leads.
     """
-    user = await get_or_create_default_user(session)
     profiles = (
         await session.scalars(
             select(FreelancerProfile)
@@ -230,9 +232,10 @@ async def list_profiles(session: AsyncSession = Depends(get_session)) -> list[Pr
 
 @router.get("/profiles/{profile_id}", response_model=ProfileDetail)
 async def get_profile(
-    profile_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    profile_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> ProfileDetail:
-    user = await get_or_create_default_user(session)
     profile = await session.scalar(
         select(FreelancerProfile).where(
             FreelancerProfile.id == profile_id, FreelancerProfile.user_id == user.id
@@ -334,21 +337,23 @@ def _out(profile: FreelancerProfile) -> ProfileOut:
 
 
 @router.get("/profile", response_model=ProfileOut)
-async def read_profile(session: AsyncSession = Depends(get_session)) -> ProfileOut:
-    user = await get_or_create_default_user(session)
+async def read_profile(
+    user: User = Depends(current_user), session: AsyncSession = Depends(get_session)
+) -> ProfileOut:
     return _out(await get_or_create_profile(session, user.id))
 
 
 @router.put("/profile", response_model=ProfileOut)
 async def update_profile(
-    payload: ProfileIn, session: AsyncSession = Depends(get_session)
+    payload: ProfileIn,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> ProfileOut:
     """Replace the profile.
 
     Scores already stored are left alone — call ``POST /jobs/rescore`` to apply the new weights.
     Keeping them separate means you can make several edits before paying for one re-score.
     """
-    user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
     config = profile.config
 
@@ -367,14 +372,15 @@ async def update_profile(
 
 
 @router.post("/profile/skills/suggest", response_model=ProfileOut)
-async def suggest_profile_skills(session: AsyncSession = Depends(get_session)) -> ProfileOut:
+async def suggest_profile_skills(
+    user: User = Depends(current_user), session: AsyncSession = Depends(get_session)
+) -> ProfileOut:
     """Propose skills the freelancer's own evidence supports but their list omits.
 
     On-demand, not automatic: this spends an LLM call, so it runs when the freelancer asks for it
     rather than silently on every account refresh. Results land in ``suggested_skills`` and feed
     nothing until accepted — see ``services.skill_suggest``.
     """
-    user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
     proposal_texts = (
@@ -400,12 +406,13 @@ async def suggest_profile_skills(session: AsyncSession = Depends(get_session)) -
 
 @router.post("/profile/skills/accept", response_model=ProfileOut)
 async def accept_profile_skills(
-    payload: SkillsAcceptIn, session: AsyncSession = Depends(get_session)
+    payload: SkillsAcceptIn,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> ProfileOut:
     """Confirm suggested skills into the real list. The freelancer may have edited a name or weight
     first, so the confirmed values — not the proposed ones — are what's stored. An accepted name is
     also cleared from the pending suggestions."""
-    user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
     accepted = [
@@ -445,10 +452,11 @@ async def accept_profile_skills(
 
 @router.post("/profile/skills/reject", response_model=ProfileOut)
 async def reject_profile_skills(
-    payload: SkillNamesIn, session: AsyncSession = Depends(get_session)
+    payload: SkillNamesIn,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> ProfileOut:
     """Dismiss suggestions without accepting them."""
-    user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
     drop = {n.strip().lower() for n in payload.names if n.strip()}
@@ -463,20 +471,21 @@ async def reject_profile_skills(
     return _out(profile)
 
 
-@router.post("/profiles/{profile_id}/sync", response_model=FullSyncOut)
-async def sync_everything(
-    profile_id: uuid.UUID, session: AsyncSession = Depends(get_session)
-) -> FullSyncOut:
-    """Refresh everything for this profile: new work from the marketplace, and your own results.
+async def require_syncable_profile(
+    profile_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> FreelancerProfile:
+    """Gate for the backend sync: resolve the profile, and refuse accounts that don't sync this way.
 
-    Run in that order deliberately. Discovery can create the project a bid points at, so doing it
-    first means fewer bids arrive referencing something we have to fetch separately.
-
-    Each half is reported on its own. They fail for different reasons — discovery can be rate
-    limited while the bid pull is fine, or the token can lack scope for one and not the other —
-    and a single "sync failed" would hide which.
+    Backend sync is Freelancer-only — it polls the Freelancer API and pulls Freelancer bids. An
+    Upwork (extension) or connection-less profile has no API to poll; it refreshes through the
+    browser extension instead. Rejecting a mis-routed call here — rather than quietly running a
+    Freelancer cycle that doesn't belong to the account — is what keeps one marketplace's work from
+    being filed under another, and it's the single place any Freelancer-only endpoint can share the
+    check. Runs as a dependency (FastAPI's request interceptor) so the handler only ever sees an
+    eligible profile.
     """
-    user = await get_or_create_default_user(session)
     profile = await session.scalar(
         select(FreelancerProfile).where(
             FreelancerProfile.id == profile_id, FreelancerProfile.user_id == user.id
@@ -485,9 +494,42 @@ async def sync_everything(
     if profile is None:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    board = await run_cycle(session, trigger="manual")
-    # A failed board fetch must not stop the bid pull: they are independent.
-    bids = await sync_bids(session, user.id)
+    connection = profile.connection
+    if (
+        connection is None
+        or connection.platform != "freelancer"
+        or connection.kind != ConnectorKind.OAUTH
+    ):
+        # 409, not 500: the request reached the wrong door. The client should route this account's
+        # refresh to the browser extension (see the frontend's platform-aware Sync).
+        raise HTTPException(
+            status_code=409,
+            detail="This account refreshes through the browser extension, not a backend sync.",
+        )
+    return profile
+
+
+@router.post("/profiles/{profile_id}/sync", response_model=FullSyncOut)
+async def sync_everything(
+    profile: FreelancerProfile = Depends(require_syncable_profile),
+    session: AsyncSession = Depends(get_session),
+) -> FullSyncOut:
+    """Refresh everything for this Freelancer profile: new work from the marketplace, and your bids.
+
+    Freelancer-only by construction — the ``require_syncable_profile`` gate refuses anything else,
+    so this never runs a Freelancer cycle for an Upwork account.
+
+    Run in that order deliberately. Discovery can create the project a bid points at, so doing it
+    first means fewer bids arrive referencing something we have to fetch separately.
+
+    Each half is reported on its own. They fail for different reasons — discovery can be rate
+    limited while the bid pull is fine, or the token can lack scope for one and not the other —
+    and a single "sync failed" would hide which.
+    """
+    board = await run_cycle(session, profile, trigger="manual")
+    # A failed board fetch must not stop the bid pull: they are independent. Scoped to *this*
+    # profile's connection, so syncing one account doesn't pull every account's bids.
+    bids = await sync_bids(session, profile.user_id, connection=profile.connection)
 
     await session.refresh(profile)
     return FullSyncOut(
@@ -506,9 +548,10 @@ async def sync_everything(
 
 
 @router.get("/connections", response_model=list[ConnectionOut])
-async def list_connections(session: AsyncSession = Depends(get_session)) -> list[ConnectionOut]:
+async def list_connections(
+    user: User = Depends(current_user), session: AsyncSession = Depends(get_session)
+) -> list[ConnectionOut]:
     """Every marketplace account linked to this user."""
-    user = await get_or_create_default_user(session)
     rows = (
         await session.scalars(
             select(PlatformConnection)
@@ -528,15 +571,15 @@ async def list_connections(session: AsyncSession = Depends(get_session)) -> list
 
 @router.put("/connections/selected", response_model=list[ConnectionOut])
 async def select_connection(
-    payload: SelectionIn, session: AsyncSession = Depends(get_session)
+    payload: SelectionIn,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> list[ConnectionOut]:
     """Scope the app to one connected account, or to all of them with a null id.
 
     Stored on the user rather than in the browser so the choice survives a new device and so the
     API can honour it later without the client having to restate it on every request.
     """
-    user = await get_or_create_default_user(session)
-
     owned: PlatformConnection | None = None
     if payload.connection_id is not None:
         owned = await session.scalar(
@@ -562,12 +605,14 @@ async def select_connection(
         profile = owned.profile or await get_or_create_profile_for_connection(session, owned)
         profile.is_selected = True
     await session.commit()
-    return await list_connections(session)
+    return await list_connections(user, session)
 
 
 @router.delete("/connections/{connection_id}", status_code=204)
 async def remove_connection(
-    connection_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    connection_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> None:
     """Disconnect a marketplace account.
 
@@ -577,7 +622,6 @@ async def remove_connection(
     it stay regardless — they are your record of work, not the platform's, and losing your bid
     history because you rotated an account would be its own bug.
     """
-    user = await get_or_create_default_user(session)
     connection = await session.scalar(
         select(PlatformConnection).where(
             PlatformConnection.id == connection_id,

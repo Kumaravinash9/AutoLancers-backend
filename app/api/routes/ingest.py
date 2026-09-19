@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 
-@router.post("/posting", response_model=CaptureResult)
+@router.post("/ondemand/job-posting", response_model=CaptureResult)
 async def capture_posting(
     payload: CapturedPosting,
     user: User = Depends(current_user),
@@ -154,7 +154,7 @@ async def capture_posting(
     )
 
 
-@router.post("/postings", response_model=CapturedPageResult)
+@router.post("/job-postings", response_model=CapturedPageResult)
 async def capture_postings(
     payload: CapturedPostings,
     user: User = Depends(current_user),
@@ -247,62 +247,68 @@ async def capture_postings(
     )
 
 
-@router.post("/collection", response_model=CapturedPageResult)
-async def capture_collection(
-    payload: CapturedPage,
-    user: User = Depends(current_user),
-    session: AsyncSession = Depends(get_session),
-) -> CapturedPageResult:
-    """Store one whole page the extension just finished reading.
+async def _record_page(
+    session: AsyncSession, user_id, payload: CapturedPage
+) -> tuple[CaptureStatus, CapturedPageResult | None]:
+    """Record that a page was read, and short-circuit a wall.
 
-    Every job-listing page maps onto the same table. "Best matches" and "Most recent" are not two
-    kinds of thing — they are two places the same marketplace shows the same postings, so both land
-    in ``projects`` deduped on ``(platform, external_id)``, and a job on both pages is one row
-    scored once. Which page it was seen on is recorded in ``bid_information.source_page`` rather
-    than in the identity of the row.
-
-    Pages with no modelled home — contracts, proposals, orders, message rooms — are accumulated
-    whole instead (see :func:`_accumulate`): those rows only exist while someone is on the page.
-
-    One request per page, and one database transaction per request: sixty jobs is one round trip,
-    not sixty. A page that fails leaves the pages already sent alone.
+    Every page — a listing or a custom page, success or wall — records the read: the app needs to
+    know it is being read as much as it needs to know it is not, and a status that only ever reports
+    failure can never be cleared. When the reader hit a wall (a login or challenge page), there is
+    nothing to store — its text is not your jobs — so this returns the finished result and the
+    caller stops. On ``ok`` it returns ``None`` and the caller does its type-specific work.
     """
-    scraped_at = payload.scraped_at or utcnow()
-
-    # Recorded on every page, success or wall — the app needs to know it is being read as much as it
-    # needs to know it is not, and a status that only ever reports failure can never be cleared.
     recorded = await record_session(
         session,
-        user.id,
+        user_id,
         payload.freelance_platform,
         payload.page_status,
         detail=payload.status_detail,
         page_key=payload.page_key,
     )
+    if payload.page_status == "ok":
+        return recorded, None
 
-    if payload.page_status != "ok":
-        # Nothing to store: a login page holds no jobs, and its text is not your contracts. The
-        # point of the request was the status, and that is already recorded.
-        await session.commit()
-        return CapturedPageResult(
-            freelance_platform=payload.freelance_platform,
-            page_key=payload.page_key,
-            reads=payload.reads,
-            received=0,
-            stored=0,
-            created=0,
-            updated=0,
-            session_status=recorded.status,
-            note=payload.status_detail
-            or (
-                "Not signed in to that marketplace."
-                if payload.page_status == "signed_out"
-                else "The marketplace served a challenge page."
-            ),
-        )
+    await session.commit()
+    return recorded, CapturedPageResult(
+        freelance_platform=payload.freelance_platform,
+        page_key=payload.page_key,
+        reads=payload.reads,
+        received=0,
+        stored=0,
+        created=0,
+        updated=0,
+        session_status=recorded.status,
+        note=payload.status_detail
+        or (
+            "Not signed in to that marketplace."
+            if payload.page_status == "signed_out"
+            else "The marketplace served a challenge page."
+        ),
+    )
 
-    if payload.reads != "jobs":
-        return await _accumulate(payload, user, session, scraped_at, recorded.status)
+
+@router.post("/job-listing", response_model=CapturedPageResult)
+async def capture_job_listing(
+    payload: CapturedPage,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> CapturedPageResult:
+    """Store one listing page of job cards the extension just finished reading.
+
+    "Best matches" and "Most recent" are not two kinds of thing — they are two places the same
+    marketplace shows the same postings, so both land in ``projects`` deduped on
+    ``(platform, external_id)``, and a job on both pages is one row scored once. Which page it was
+    seen on is recorded in ``bid_information.source_page`` rather than in the identity of the row.
+
+    One request per page, and one database transaction per request: sixty jobs is one round trip,
+    not sixty. A page that fails leaves the pages already sent alone. Pages with no modelled home
+    (contracts, proposals, rooms) go to ``/ingest/custom-pages`` instead.
+    """
+    scraped_at = payload.scraped_at or utcnow()
+    recorded, wall = await _record_page(session, user.id, payload)
+    if wall is not None:
+        return wall
 
     # Attribute the page's jobs to the account it was read under, not just the selected profile.
     profile = await get_or_create_profile_for_account(
@@ -387,6 +393,26 @@ async def capture_collection(
         llm_error=llm_error,
         session_status=recorded.status,
     )
+
+
+@router.post("/custom-pages", response_model=CapturedPageResult)
+async def capture_custom_pages(
+    payload: CapturedPage,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> CapturedPageResult:
+    """Store one page that has no modelled home yet — contracts, proposals, orders, message rooms.
+
+    These arrive as loose rows the reader assumes nothing about, because every marketplace lays them
+    out differently. They are kept verbatim (see :func:`_accumulate`) so v2 has the history to model
+    them from, rather than thrown away because there is no table for them today. Jobs go to
+    ``/ingest/job-listing`` instead.
+    """
+    scraped_at = payload.scraped_at or utcnow()
+    recorded, wall = await _record_page(session, user.id, payload)
+    if wall is not None:
+        return wall
+    return await _accumulate(payload, user, session, scraped_at, recorded.status)
 
 
 async def _accumulate(
