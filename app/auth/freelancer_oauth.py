@@ -254,6 +254,20 @@ async def get_valid_access_token(
             f"No {platform} token stored. Run: uv run python scripts/oauth_login.py"
         )
 
+    # A caller-supplied connection skips the filters above, so re-check what the query would have
+    # guaranteed. An extension-linked account (Upwork) is a real, active connection that holds no
+    # OAuth token at all — passing one here used to reach ``decrypt(None)`` and die with an
+    # AttributeError instead of the "not authenticated" signal callers already handle.
+    if row.platform != platform:
+        raise OAuthError(
+            f"Connection {row.id} is for {row.platform}, not {platform}."
+        )
+    if not row.access_token_encrypted:
+        raise OAuthError(
+            f"No {platform} access token on connection {row.id} "
+            f"(linked via {row.kind})."
+        )
+
     if _needs_refresh(row):
         if not row.refresh_token_encrypted:
             raise OAuthError(

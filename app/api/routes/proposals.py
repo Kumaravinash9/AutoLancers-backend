@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.api.schemas import ProposalOut, ProposalStats
+from app.auth.accounts import current_user
 from app.db.models import (
     FreelancerProfile,
     Project,
@@ -25,7 +26,7 @@ from app.db.models import (
 )
 from app.db.session import get_session
 from app.services.bid_sync import sync_bids
-from app.services.users import get_or_create_default_user, get_or_create_profile
+from app.services.users import get_or_create_profile
 
 router = APIRouter(prefix="/proposals", tags=["proposals"])
 
@@ -76,9 +77,9 @@ async def list_proposals(
         description="Scope to one marketplace account. Omit for all of them.",
     ),
     limit: int = Query(default=100, le=500),
+    user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[ProposalOut]:
-    user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
     query = (
@@ -106,10 +107,10 @@ async def list_proposals(
 @router.get("/stats", response_model=ProposalStats)
 async def stats(
     connection_id: uuid.UUID | None = Query(default=None),
+    user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> ProposalStats:
     """Does a higher score actually convert? This is where you find out."""
-    user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
     mine = Proposal.freelancer_id == profile.id
@@ -165,11 +166,12 @@ async def stats(
 
 
 @router.post("/sync")
-async def sync(session: AsyncSession = Depends(get_session)) -> dict[str, object]:
+async def sync(
+    user: User = Depends(current_user), session: AsyncSession = Depends(get_session)
+) -> dict[str, object]:
     """Pull real bids and their award status back from Freelancer.
 
     This is the only source of truth for whether you were selected — nothing else in the system
     can know that.
     """
-    user = await get_or_create_default_user(session)
     return (await sync_bids(session, user.id)).as_dict()

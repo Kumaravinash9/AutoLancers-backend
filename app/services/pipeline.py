@@ -29,6 +29,7 @@ from app.db.models import (
     CycleRun,
     DiscoveryMethod,
     FreelancerProfile,
+    PlatformConnection,
     Project,
     Proposal,
     ProposalAIVersion,
@@ -41,7 +42,6 @@ from app.services.drafting import DraftingError, draft_proposal
 from app.services.matching import MatchingError, SkillMatch, match_skills
 from app.services.scoring import hard_reject_reason, score_job
 from app.services.skill_expansion import SkillExpansionError, expand_skill_terms
-from app.services.users import get_or_create_default_user, get_or_create_profile
 
 logger = logging.getLogger(__name__)
 
@@ -96,22 +96,38 @@ class CycleReport:
         return self.__dict__.copy()
 
 
-async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport:
-    """Run one cycle and record what happened."""
+async def run_cycle(
+    session: AsyncSession, profile: FreelancerProfile, trigger: str = "poll"
+) -> CycleReport:
+    """Run one cycle for one profile and record what happened.
+
+    The profile is passed in rather than resolved here: discovery is per marketplace account, so
+    the caller — the scheduler fanning out over every connected account, or a request acting for
+    the signed-in user — is the only thing that knows which one this cycle is for.
+    """
     started = time.monotonic()
     report = CycleReport()
-
-    user = await get_or_create_default_user(session)
-    profile = await get_or_create_profile(session, user.id)
+    user_id = profile.user_id
 
     # A token is optional: the public project search works unauthenticated, so an unconnected
     # account degrades to reduced discovery rather than no product at all.
-    try:
-        token = await get_valid_access_token(session, user.id)
-    except OAuthError as exc:
+    own = profile.connection
+    if own is not None and own.platform != "freelancer":
+        # This profile mirrors another marketplace (Upwork arrives through the extension). It has
+        # no Freelancer token of its own, and borrowing a sibling account's would file one
+        # account's discoveries under another — so this board stays on the public search.
         token = None
         report.authenticated = False
-        logger.info("Running unauthenticated: %s", exc)
+        logger.info("Profile %s mirrors %s; discovering unauthenticated", profile.id, own.platform)
+    else:
+        # Scoped to this profile's own connection, so with two Freelancer accounts linked one
+        # account's token is never spent fetching the other's board.
+        try:
+            token = await get_valid_access_token(session, user_id, connection=own)
+        except OAuthError as exc:
+            token = None
+            report.authenticated = False
+            logger.info("Running unauthenticated: %s", exc)
 
     client = create_connector("freelancer", access_token=token)
 
@@ -131,7 +147,7 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
     except FreelancerAPIError as exc:
         report.error = str(exc)
         logger.warning("Skipping cycle: %s", exc)
-        await _record(session, user.id, report, started, trigger)
+        await _record(session, user_id, report, started, trigger)
         return report
 
     if truncated:
@@ -175,7 +191,7 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
 
     report.drafted, report.draft_failures = await _draft_pending(session, profile)
 
-    await _record(session, user.id, report, started, trigger)
+    await _record(session, user_id, report, started, trigger)
 
     logger.info(
         "Cycle: fetched=%d new=%d changed=%d unchanged=%d drafted=%d draft_failures=%d",
@@ -187,6 +203,52 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
         report.draft_failures,
     )
     return report
+
+
+async def pollable_profiles(session: AsyncSession) -> list[FreelancerProfile]:
+    """Every profile the poller should run a cycle for.
+
+    One per active Freelancer connection. Profiles for other marketplaces are excluded because
+    discovery there is not a poll — the Upwork board arrives through the extension — and a
+    connection-less profile is excluded because it has no account to discover against.
+    """
+    return list(
+        (
+            await session.scalars(
+                select(FreelancerProfile)
+                .join(PlatformConnection, PlatformConnection.id == FreelancerProfile.connection_id)
+                .where(
+                    PlatformConnection.platform == "freelancer",
+                    PlatformConnection.status == "ACTIVE",
+                    PlatformConnection.disconnected_at.is_(None),
+                )
+                .order_by(FreelancerProfile.created_at)
+            )
+        )
+        .unique()
+        .all()
+    )
+
+
+async def run_all_cycles(session: AsyncSession, trigger: str = "poll") -> list[CycleReport]:
+    """Run a cycle for every connected account.
+
+    One account's failure must not cost the others their cycle, so each is caught here rather than
+    allowed to end the sweep — the same reason a single bad posting doesn't end a cycle.
+    """
+    profiles = await pollable_profiles(session)
+    if not profiles:
+        logger.info("No connected accounts to poll")
+        return []
+
+    reports: list[CycleReport] = []
+    for profile in profiles:
+        try:
+            reports.append(await run_cycle(session, profile, trigger=trigger))
+        except Exception:
+            logger.exception("Cycle failed for profile %s", profile.id)
+            await session.rollback()
+    return reports
 
 
 async def _fetch_new_postings(

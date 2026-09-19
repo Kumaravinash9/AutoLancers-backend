@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import AuthStatus
+from app.auth.accounts import current_user
 from app.auth.freelancer_oauth import (
     OAuthError,
     build_authorize_url,
@@ -15,9 +16,8 @@ from app.auth.freelancer_oauth import (
     store_token,
 )
 from app.config import get_settings
-from app.db.models import PlatformConnection
+from app.db.models import PlatformConnection, User
 from app.db.session import get_session
-from app.services.users import get_or_create_default_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -39,6 +39,7 @@ async def login() -> RedirectResponse:
 
 @router.get("/freelancer/callback")
 async def callback(
+    request: Request,
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
@@ -55,9 +56,17 @@ async def callback(
 
     _pending_states.discard(state)
 
+    # Resolved by hand rather than as a dependency: this endpoint answers a browser redirect, so a
+    # signed-out visitor belongs back on /settings with a reason, not looking at a raw 401 body.
+    # The session cookie is SameSite=lax, which a top-level navigation from the provider still
+    # carries — so arriving here without one means genuinely signed out.
+    try:
+        user = await current_user(request, session)
+    except HTTPException:
+        return RedirectResponse(f"{frontend}/settings?connected=0&error=not_signed_in")
+
     try:
         token = await exchange_code(code)
-        user = await get_or_create_default_user(session)
         await store_token(session, user.id, token)
     except OAuthError as exc:
         return RedirectResponse(f"{frontend}/settings?connected=0&error={exc}")
@@ -68,9 +77,9 @@ async def callback(
 @router.get("/status", response_model=AuthStatus)
 async def status(
     platform: str = Query(default="freelancer"),
+    user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> AuthStatus:
-    user = await get_or_create_default_user(session)
     row = await session.scalar(
         select(PlatformConnection).where(
             PlatformConnection.user_id == user.id,

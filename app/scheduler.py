@@ -14,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import get_settings
 from app.db.session import SessionLocal
 from app.services.connections import purge_disconnected_connections
-from app.services.pipeline import prune_stale_jobs, run_cycle
+from app.services.pipeline import prune_stale_jobs, run_all_cycles
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,9 @@ async def _poll() -> None:
     # logs and guarantees the job stays scheduled.
     try:
         async with SessionLocal() as session:
-            await run_cycle(session)
+            # One cycle per connected account. Which accounts exist is read fresh each tick, so a
+            # marketplace connected between polls is picked up without a restart.
+            await run_all_cycles(session)
     except Exception:
         logger.exception("Poll cycle failed")
 

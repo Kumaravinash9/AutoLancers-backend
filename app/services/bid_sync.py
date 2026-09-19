@@ -69,18 +69,30 @@ class SyncReport:
         return self.__dict__.copy()
 
 
-async def sync_bids(session: AsyncSession, user_id: uuid.UUID) -> SyncReport:
+async def sync_bids(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    connection: PlatformConnection | None = None,
+) -> SyncReport:
+    """Pull bids back from Freelancer for one account, or all of the user's when none is given.
+
+    A per-profile sync passes that profile's ``connection`` so it doesn't sweep every account; the
+    user-wide ``/proposals/sync`` passes nothing and syncs them all.
+    """
     report = SyncReport()
 
-    connections = (
-        await session.scalars(
-            select(PlatformConnection).where(
-                PlatformConnection.user_id == user_id,
-                PlatformConnection.platform == "freelancer",
-                PlatformConnection.status == "ACTIVE",
+    if connection is not None:
+        connections = [connection]
+    else:
+        connections = (
+            await session.scalars(
+                select(PlatformConnection).where(
+                    PlatformConnection.user_id == user_id,
+                    PlatformConnection.platform == "freelancer",
+                    PlatformConnection.status == "ACTIVE",
+                )
             )
-        )
-    ).all()
+        ).all()
     if not connections:
         report.error = "No freelancer account connected."
         return report
@@ -88,9 +100,9 @@ async def sync_bids(session: AsyncSession, user_id: uuid.UUID) -> SyncReport:
     # Every connected account contributes its own bids to its own profile. Syncing only the first
     # would silently under-report someone operating two, and attributing them all to one profile
     # would mix two accounts' win rates.
-    for connection in connections:
-        profile = await get_or_create_profile_for_connection(session, connection)
-        await _sync_one(session, user_id, profile, connection, report)
+    for conn in connections:
+        profile = await get_or_create_profile_for_connection(session, conn)
+        await _sync_one(session, user_id, profile, conn, report)
         profile.bids_synced_at = utcnow()
 
     await session.commit()

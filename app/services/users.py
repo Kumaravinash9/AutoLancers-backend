@@ -12,8 +12,10 @@ import logging
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.connectors import ConnectorKind
 from app.db.models import (
     FreelancerProfile,
@@ -25,17 +27,28 @@ from app.db.models import (
 
 logger = logging.getLogger(__name__)
 
-# Used by the CLI scripts and the poller, which run without a signed-in request.
-DEFAULT_USER_EMAIL = "owner@localhost"
-
-
 async def get_or_create_default_user(session: AsyncSession) -> User:
-    """The account background jobs act as when no one is signed in."""
-    user = await session.scalar(select(User).where(User.email == DEFAULT_USER_EMAIL))
+    """The account background jobs act as when no one is signed in.
+
+    Configurable (``DEFAULT_USER_EMAIL``) rather than fixed: every request now carries its own
+    identity, so this covers only the poller and the CLI scripts — and those have to run as the
+    account that actually owns the connected marketplace profiles. Hardcoding one email meant
+    signing in as anyone else showed a board nothing was ever polling.
+    """
+    email = get_settings().default_user_email
+    user = await session.scalar(select(User).where(User.email == email))
     if user is None:
-        user = User(email=DEFAULT_USER_EMAIL, role=Role.ADMIN, name="Owner")
+        user = User(email=email, role=Role.ADMIN, name="Owner")
         session.add(user)
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Two callers bootstrapping the same account at once; the unique email refuses the
+            # second. Whichever row landed is the account either of us wanted.
+            await session.rollback()
+            user = await session.scalar(select(User).where(User.email == email))
+            if user is None:
+                raise
         await session.refresh(user)
     return user
 
@@ -48,6 +61,17 @@ def _ensure_config(session: AsyncSession, profile: FreelancerProfile) -> Freelan
     return profile
 
 
+async def _scoped_profile(
+    session: AsyncSession, user_id: uuid.UUID
+) -> FreelancerProfile | None:
+    return await session.scalar(
+        select(FreelancerProfile)
+        .where(FreelancerProfile.user_id == user_id)
+        # Selected first, then oldest — a stable, single answer when several exist.
+        .order_by(FreelancerProfile.is_selected.desc(), FreelancerProfile.created_at.asc())
+    )
+
+
 async def get_or_create_profile(
     session: AsyncSession, user_id: uuid.UUID
 ) -> FreelancerProfile:
@@ -57,18 +81,28 @@ async def get_or_create_profile(
     connection-less default if they have none yet. This is what callers that hold only a user reach
     for — the poller, the CLI, and every read that isn't already about one specific account.
     """
-    profile = await session.scalar(
-        select(FreelancerProfile)
-        .where(FreelancerProfile.user_id == user_id)
-        # Selected first, then oldest — a stable, single answer when several exist.
-        .order_by(FreelancerProfile.is_selected.desc(), FreelancerProfile.created_at.asc())
-    )
+    profile = await _scoped_profile(session, user_id)
     if profile is None:
-        profile = FreelancerProfile(user_id=user_id, is_selected=True, config=ProfileConfig())
-        session.add(profile)
-        await session.commit()
-        await session.refresh(profile)
-        return profile
+        created = FreelancerProfile(user_id=user_id, is_selected=True, config=ProfileConfig())
+        session.add(created)
+        try:
+            await session.commit()
+        except IntegrityError:
+            # A concurrent request for the same brand-new user got there first. The dashboard
+            # opens several endpoints at once, so on a fresh account this is the normal path, not
+            # an edge case: both requests find nothing and both insert, and the partial unique
+            # index on ``is_selected`` refuses the loser. Theirs is as good as ours — adopt it.
+            #
+            # Re-selected rather than refreshed: ``config`` is ``lazy="selectin"``, so a select
+            # brings it with the row, while ``refresh`` would expire it into a lazy load that
+            # async SQLAlchemy refuses outside a greenlet.
+            await session.rollback()
+            profile = await _scoped_profile(session, user_id)
+            if profile is None:  # not the race, then — a real constraint failure
+                raise
+        else:
+            await session.refresh(created)
+            return created
 
     if profile.config is None:
         _ensure_config(session, profile)
@@ -96,24 +130,27 @@ async def get_or_create_profile_for_connection(
             await session.refresh(profile)
         return profile
 
-    # Adopt an existing connection-less default (the fresh-account placeholder) if any, so a first
-    # connection enriches the profile the user already has rather than duplicating it.
-    profile = await session.scalar(
-        select(FreelancerProfile).where(
-            FreelancerProfile.user_id == connection.user_id,
-            FreelancerProfile.connection_id.is_(None),
+    # Adopt the user's connection-less default ONLY when it is their *only* profile — the genuine
+    # fresh-start case, where config set before connecting should carry over. A connection is
+    # ``ON DELETE SET NULL`` on the profile, so a purged account also leaves a connection-less
+    # profile behind; if the user already has other profiles, a stray connection-less one is that
+    # orphan, not a placeholder, and adopting it would graft a dead account's data onto this new
+    # one — so create a fresh profile instead.
+    existing = (
+        await session.scalars(
+            select(FreelancerProfile).where(FreelancerProfile.user_id == connection.user_id)
         )
-    )
-    has_any = await session.scalar(
-        select(FreelancerProfile.id).where(FreelancerProfile.user_id == connection.user_id)
-    )
+    ).all()
+    default = next((p for p in existing if p.connection_id is None), None)
 
-    if profile is None:
+    if default is not None and len(existing) == 1:
+        profile = default
+    else:
         profile = FreelancerProfile(
             user_id=connection.user_id,
             config=ProfileConfig(),
             # First profile for this user becomes the selected one.
-            is_selected=has_any is None,
+            is_selected=not existing,
         )
         session.add(profile)
 

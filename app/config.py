@@ -18,8 +18,17 @@ class Settings(BaseSettings):
     # emergency lever.
     jwt_secret: str = ""
     session_ttl_hours: int = 24 * 14
+    # How long the JWT the app hands the browser extension stays valid. Short by design — the app
+    # re-mints it on each connect/sign-in — so a token lifted off a machine expires on its own.
+    extension_token_ttl_hours: int = 12
     # Cookies are only marked Secure over HTTPS; leave false for local http development.
     cookie_secure: bool = False
+
+    # The account the poller and the CLI scripts act as. Requests carry their own identity, so this
+    # only covers the paths with no signed-in user behind them. It has to name the account whose
+    # profiles you actually want polled — pointing it at an account with no connected marketplace
+    # means discovery runs against an empty profile and quietly finds nothing.
+    default_user_email: str = "owner@localhost"
 
     # Which LLM drafts proposals and judges skill matches: "gemini", "anthropic" or "nvidia".
     llm_provider: str = "gemini"
