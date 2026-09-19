@@ -61,6 +61,17 @@ class Settings(BaseSettings):
     enable_bidding: bool = False
 
     frontend_origin: str = "http://localhost:3000"
+
+    # Whether POST /ingest/parse needs a token.
+    #
+    # False while you are testing, so the extension's "Read with AI" button works before anyone has
+    # issued themselves a token. That endpoint calls a paid model, so with this off it is an open
+    # proxy to your LLM quota for anything that can reach the port — harmless on localhost, an
+    # unmetered bill the moment the backend is reachable from anywhere else.
+    #
+    # Set it to true before exposing this service. The startup log says which way it is set, every
+    # time, because a security default that flips silently is the kind that ships.
+    parse_requires_auth: bool = False
     # Every 30 minutes. Freelancer's terms ask for cached data to be refreshed at least
     # daily, and a tighter loop mostly re-reads postings that haven't changed.
     poll_interval_seconds: int = 1800

@@ -23,7 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.freelancer_oauth import OAuthError, get_valid_access_token
 from app.config import get_settings
-from app.connectors.freelancer import FreelancerAPIError, FreelancerClient, JobPosting
+from app.connectors import Connector, create_connector
+from app.connectors.freelancer import FreelancerAPIError, JobPosting
 from app.db.models import (
     CycleRun,
     DiscoveryMethod,
@@ -112,7 +113,7 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
         report.authenticated = False
         logger.info("Running unauthenticated: %s", exc)
 
-    client = FreelancerClient(access_token=token)
+    client = create_connector("freelancer", access_token=token)
 
     # Filter server-side by the profile's skills, broadened into the marketplace's tag vocabulary
     # so generically-tagged jobs surface too. Cached on the profile and recomputed only when the
@@ -189,7 +190,7 @@ async def run_cycle(session: AsyncSession, trigger: str = "poll") -> CycleReport
 
 
 async def _fetch_new_postings(
-    client: FreelancerClient,
+    client: Connector,
     skill_ids: list[int],
     since: dt.datetime | None,
     max_pages: int,
@@ -230,7 +231,7 @@ def _search_skill_ids_key(names: list[str], expansion_enabled: bool) -> str:
 
 
 async def _resolve_search_skill_ids(
-    client: FreelancerClient, profile: FreelancerProfile, report: CycleReport
+    client: Connector, profile: FreelancerProfile, report: CycleReport
 ) -> list[int]:
     """Resolve the profile's confirmed skills — widened for discovery — to Freelancer skill IDs.
 
@@ -419,7 +420,9 @@ async def _ingest(
             skill_match = await match_skills(posting, profile)
         except MatchingError as exc:
             # A failed call must not stop ingest — scoring falls back to substring matching.
-            logger.warning("Skill match failed for %s, using substring: %s", posting.external_id, exc)
+            logger.warning(
+                "Skill match failed for %s, using substring: %s", posting.external_id, exc
+            )
             skill_match = None
         # Only cache a genuine verdict. A budget-deferred job never reaches here, so it stays a
         # cache miss and gets another turn on a later cycle.

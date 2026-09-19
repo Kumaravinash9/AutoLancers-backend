@@ -341,6 +341,8 @@ class ProfileCard(BaseModel):
     availability: str
     status: str
     platforms: list[str]
+    # True for the account (profile) the app is currently scoped to. At most one per user.
+    is_selected: bool = False
     last_synced_at: dt.datetime | None
     bids_synced_at: dt.datetime | None
     recommendations: int
@@ -423,6 +425,33 @@ class DemoRequestOut(BaseModel):
     created_at: dt.datetime
 
 
+class CapturedClient(BaseModel):
+    """The hiring client, as the posting advertises them.
+
+    Stored on the project but never scored directly — a client's history is what a person reads to
+    decide whether a bid is worth the connects, so it travels with the posting rather than being a
+    second lookup.
+    """
+
+    name: str | None = None
+    rating: float | None = None
+    country: str | None = None
+    reviews: int | None = None
+    total_spent: float | None = None
+    total_hires: int | None = None
+    payment_verified: bool | None = None
+    member_since: str | None = None
+
+    def columns(self) -> dict[str, Any]:
+        """Only the four that have a column of their own on ``projects``."""
+        return {
+            "client_name": self.name,
+            "client_rating": self.rating,
+            "client_country": self.country,
+            "client_reviews_count": self.reviews,
+        }
+
+
 class CapturedPosting(BaseModel):
     """A posting read off a page by the extension.
 
@@ -432,6 +461,9 @@ class CapturedPosting(BaseModel):
     """
 
     platform: str = Field(default="upwork", max_length=50)
+    # The signed-in account this page was read under (its stable marketplace id). Attributes the
+    # capture to that account's profile; falls back to the selected profile when absent.
+    account_id: str | None = Field(default=None, max_length=255)
     external_id: str = Field(min_length=1, max_length=200)
     url: str = Field(max_length=1000)
     title: str = Field(min_length=1, max_length=500)
@@ -443,6 +475,133 @@ class CapturedPosting(BaseModel):
     currency: str | None = None
     proposal_count: int | None = None
     posted_at: dt.datetime | None = None
+    # Sent by the extension's job-page reader, which has always scraped it. Optional so an older
+    # extension build keeps working unchanged.
+    client: CapturedClient | None = None
+    experience_level: str | None = None
+    project_length: str | None = None
+
+    # Ask the LLM to read the raw page and fill any field the selectors missed (see /ingest/parse).
+    # Costs a model call, so it's opt-in: the extension sets it when it wants accuracy over speed,
+    # and sends the visible page text for the model to read.
+    is_llm_required: bool = False
+    page_text: str | None = Field(default=None, max_length=200_000)
+
+
+class CapturedPostings(BaseModel):
+    """Several job pages read one at a time, sent together.
+
+    The deep pass opens each job's own page for the description a listing truncates — one page load
+    per job. Holding all of them until the pass finished meant a run cancelled at job 28 of 31 filed
+    nothing at all, every page load spent and no record of it. Batching flushes the work as it is
+    done, so what has been read stays read.
+    """
+
+    postings: list[CapturedPosting] = Field(default_factory=list, max_length=200)
+
+
+class CapturedPage(BaseModel):
+    """One page the extension finished reading, sent as its selectors found it.
+
+    Raw on purpose. ``budget`` arrives as ``"$500.00 - $1,000.00"`` and ``posted`` as
+    ``"3 hours ago"``, because parsing those belongs in one tested place on this side rather than
+    duplicated in JavaScript — see ``services.capture``.
+    """
+
+    # Named for what it is rather than reusing ``platform``: this is the marketplace the pages were
+    # read from, and the extension speaks in those terms throughout.
+    freelance_platform: str = Field(max_length=50)
+    # The signed-in account this page was read under (its stable marketplace id). Attributes the
+    # captured jobs to that account's profile; falls back to the selected profile when absent.
+    account_id: str | None = Field(default=None, max_length=255)
+    page_key: str = Field(max_length=100)
+    page_label: str = Field(default="", max_length=200)
+    # Which reader ran, which is what decides how ``items`` is shaped. Mirrors the ``reads``
+    # declaration in the extension's platform registry.
+    reads: str = Field(pattern="^(jobs|rows|rooms)$")
+    page_url: str = Field(default="", max_length=1000)
+    # The moment the page was read, from the client's clock. Relative timestamps ("3 hours ago") are
+    # resolved against this, so a payload that waited in a queue does not drift.
+    scraped_at: dt.datetime | None = None
+
+    # Whether the reader got the page or a wall in front of it.
+    #
+    # Signed out, a marketplace serves a login page that loads perfectly and holds no jobs — so
+    # without this a logged-out collection reports an honest-looking zero for every page, and the
+    # board stops being refreshed while still looking authoritative. Recorded against the user so
+    # the app can say "your Upwork session expired" instead of showing stale scores.
+    page_status: str = Field(default="ok", pattern="^(ok|signed_out|blocked)$")
+    # The reader's own words, so the app shows a reason rather than a status code.
+    status_detail: str = Field(default="", max_length=500)
+
+    # Whether to pay for an LLM reading of ``page_text`` to fill what the selectors missed. A
+    # request, not an instruction: the server still skips the call when nothing is actually missing,
+    # and the response says whether it happened.
+    is_llm_required: bool = False
+
+    items: list[dict[str, Any]] = []
+    # Only sent when ``is_llm_required``; the LLM's entire input.
+    page_text: str = Field(default="", max_length=200_000)
+
+
+class CapturedItemResult(BaseModel):
+    external_id: str | None
+    title: str
+    project_id: uuid.UUID | None
+    created: bool
+    score: float | None
+    rejected: bool
+    rejection_reason: str | None
+
+
+class CapturedPageResult(BaseModel):
+    """What became of one captured page. Counts first, then per-item detail.
+
+    Deliberately granular. "Sent ✓" is the least useful thing a response can say — a page whose
+    selectors found twelve links and stored none is a broken selector, and that must be visible
+    without opening the database.
+    """
+
+    freelance_platform: str
+    page_key: str
+    reads: str
+    received: int
+    stored: int
+    created: int
+    updated: int
+    # Rows that arrived with no marketplace id, and so nothing to dedupe a later sighting against.
+    skipped_no_id: int = 0
+    # Rows that were the same posting as another in this payload.
+    duplicates: int = 0
+    llm_used: bool = False
+    llm_model: str | None = None
+    llm_fields_filled: int = 0
+    llm_unmatched: int = 0
+    llm_error: str | None = None
+    # Set instead of ``items`` when the page was kept as a raw capture — contracts, proposals,
+    # orders, room lists. Something to look the accumulated rows up by.
+    capture_id: uuid.UUID | None = None
+    # Echoed back so the extension can confirm the app knows, rather than assume it landed.
+    session_status: str = "OK"
+    note: str | None = None
+    items: list[CapturedItemResult] = []
+
+
+class CaptureStatusOut(BaseModel):
+    """Whether the extension can currently read one marketplace — what a banner renders from."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    platform: str
+    status: str
+    detail: str | None
+    page_key: str | None
+    # When it first went wrong; null while OK. "Signed out for three days" and "signed out just
+    # now" deserve different words, which one timestamp cannot say.
+    since: dt.datetime | None
+    last_checked_at: dt.datetime
+    # Null means the extension has never read this marketplace — not that anything expired.
+    last_ok_at: dt.datetime | None
 
 
 class CaptureResult(BaseModel):
@@ -454,12 +613,34 @@ class CaptureResult(BaseModel):
     rejection_reason: str | None
     reasons: list[dict[str, Any]]
 
+    # Whether the LLM was asked to read the page, which model answered, how many fields it filled,
+    # and — distinct from "not used" — whether it was asked but failed.
+    llm_used: bool = False
+    llm_model: str | None = None
+    llm_fields_filled: int = 0
+    llm_error: str | None = None
+
 
 class CapturedProfile(BaseModel):
     """Your own marketplace profile, read off your profile page."""
 
     platform: str = Field(default="upwork", max_length=50)
     username: str = Field(min_length=1, max_length=255)
+
+    # The account's stable marketplace id, read from the profile URL (Upwork's ~01… cipher id, a
+    # numeric id elsewhere). This — not the mutable username — is the account's identity: it keys
+    # the connection and lines up with the id OAuth stores, so one real account is one connection.
+    # Optional so an older extension that only sends the handle still works (username is fallback).
+    account_id: str | None = Field(default=None, max_length=255)
+
+    # Whether the extension confirmed this is the *signed-in user's own* profile, by comparing the
+    # account id in the URL against the id the marketplace's own header links to.
+    #
+    # No URL pattern can make that distinction — ``/freelancers/~01…`` matches every freelancer on
+    # Upwork — and this payload overwrites the profile row every score in the app is computed from.
+    # ``None`` means the extension could not tell, and is refused like ``False``: "probably yours"
+    # is not good enough. Defaults to ``None`` so an older extension build fails closed.
+    is_own: bool | None = None
     display_name: str | None = None
     tagline: str | None = None
     summary: str | None = None
@@ -467,9 +648,29 @@ class CapturedProfile(BaseModel):
     hourly_rate: float | None = None
     currency: str | None = None
     country: str | None = None
+
+    # Ask the LLM to read the raw profile page and fill any field the selectors missed. Opt-in and
+    # costs a model call — the extension sets it and sends the page text when accuracy matters most.
+    is_llm_required: bool = False
+    page_text: str | None = Field(default=None, max_length=200_000)
     avatar_url: str | None = None
     rating: float | None = None
     total_reviews: int | None = None
+
+
+class ExtensionToken(BaseModel):
+    """A JWT the app mints for the browser extension, plus who it is for.
+
+    ``user_id`` matters as much as the token. The extension holds one credential at a time, and a
+    browser where a second person signed in afterwards would otherwise keep the first one's — filing
+    one user's marketplace data into another's account, with a progress bar and no error. Returning
+    the identity is what lets the caller check before it starts rather than discover afterwards.
+    """
+
+    token: str
+    user_id: uuid.UUID
+    email: str
+    expires_at: dt.datetime
 
 
 class ApiTokenOut(BaseModel):
@@ -492,7 +693,9 @@ class ApiTokenIn(BaseModel):
 class PageParseIn(BaseModel):
     """Visible text of a page, for the LLM reader."""
 
-    kind: str = Field(pattern="^(profile|job)$")
+    # The list kinds (jobs, proposals, contracts) return an ``items`` array in ``fields``; the
+    # singular kinds return one object. See ``services.page_parse.LIST_KINDS``.
+    kind: str = Field(pattern="^(profile|job|jobs|proposals|contracts)$")
     url: str = Field(default="", max_length=1000)
     text: str = Field(min_length=40, max_length=200_000)
 

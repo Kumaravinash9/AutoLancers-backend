@@ -48,7 +48,11 @@ from app.services.skill_suggest import (
     SkillSuggestError,
     suggest_skills,
 )
-from app.services.users import get_or_create_default_user, get_or_create_profile
+from app.services.users import (
+    get_or_create_default_user,
+    get_or_create_profile,
+    get_or_create_profile_for_connection,
+)
 
 router = APIRouter(tags=["profiles"])
 
@@ -92,17 +96,42 @@ async def _counts(session: AsyncSession, profile: FreelancerProfile) -> tuple[in
     return recs, props, wins
 
 
+async def _connection_counts(
+    session: AsyncSession, connection: PlatformConnection
+) -> tuple[int, int]:
+    """Proposals placed and won through one connection. Per account, never a shared total."""
+    placed = (
+        await session.scalar(
+            select(func.count(Proposal.id)).where(Proposal.connection_id == connection.id)
+        )
+        or 0
+    )
+    won = (
+        await session.scalar(
+            select(func.count(Proposal.id)).where(
+                Proposal.connection_id == connection.id,
+                Proposal.status == ProposalStatus.ACCEPTED,
+            )
+        )
+        or 0
+    )
+    return placed, won
+
+
+def _avatar(profile: FreelancerProfile) -> str | None:
+    """The profile's marketplace avatar, or None.
+
+    Freelancer serves a grey placeholder for accounts with no picture; treat it as no picture so the
+    UI can fall back to initials instead.
+    """
+    url = profile.avatar_url or ""
+    return None if url.endswith("unknown.png") else (url or None)
+
+
 async def _card(
     session: AsyncSession, profile: FreelancerProfile, user: User
 ) -> dict:
-    connections = (
-        await session.scalars(
-            select(PlatformConnection).where(
-                PlatformConnection.user_id == user.id,
-                PlatformConnection.disconnected_at.is_(None),
-            )
-        )
-    ).all()
+    connection = profile.connection
     recs, props, wins = await _counts(session, profile)
     skills = [s["name"] for s in (profile.skills or []) if s.get("name")]
 
@@ -110,10 +139,8 @@ async def _card(
         "id": profile.id,
         "display_name": profile.display_name or user.name or user.email,
         "headline": profile.headline,
-        # Prefer the marketplace avatar; fall back to anything set on the account.
-        "profile_image": next(
-            (c.avatar_url for c in connections if c.avatar_url), user.profile_image
-        ),
+        # The marketplace avatar mirrored onto the profile; fall back to the account's own image.
+        "profile_image": _avatar(profile) or user.profile_image,
         "initials": _initials(profile.display_name or user.name or "", user.email),
         # Cards show a handful; the rest are counted rather than listed.
         "skills": skills[:8],
@@ -123,23 +150,29 @@ async def _card(
         "currency": profile.currency,
         "availability": profile.availability,
         "status": profile.status,
-        "platforms": [c.platform for c in connections],
+        # One profile mirrors at most one account, so at most one platform.
+        "platforms": [connection.platform] if connection else [],
+        "is_selected": profile.is_selected,
         "last_synced_at": profile.last_synced_at,
         "bids_synced_at": profile.bids_synced_at,
         "recommendations": recs,
         "proposals": props,
         "wins": wins,
-        "_connections": connections,
+        "_connection": connection,
     }
 
 
 def _connection_out(
-    c: PlatformConnection, proposals: int = 0, wins: int = 0, selected: bool = False
+    c: PlatformConnection,
+    profile: FreelancerProfile | None,
+    proposals: int = 0,
+    wins: int = 0,
 ) -> ConnectionOut:
-    """One connection as the API returns it.
+    """One connection as the API returns it, with the public profile it links to.
 
-    Built in one place because both the profile detail and the connections list serve the same
-    shape, and a field added to one but not the other shows up as a silently empty card.
+    The wire shape is deliberately flat and unchanged: the marketplace-mirror fields now live on the
+    linked :class:`FreelancerProfile`, but the client still reads them here. Built in one place
+    because both the profile detail and the connections list serve the same shape.
     """
     return ConnectionOut(
         id=c.id,
@@ -148,39 +181,51 @@ def _connection_out(
         platform=c.platform,
         platform_username=c.platform_username,
         scope=c.scope,
-        rating=c.rating,
-        total_reviews=c.total_reviews,
-        # Freelancer serves a grey placeholder for accounts with no picture; treat it as no
-        # picture so the UI can fall back to initials instead.
-        avatar_url=None if (c.avatar_url or "").endswith("unknown.png") else c.avatar_url,
         status=c.status,
-        is_selected=selected,
-        display_name=c.display_name,
-        tagline=c.tagline,
-        summary=c.summary,
-        account_skills=c.account_skills or [],
-        hourly_rate=c.hourly_rate,
-        currency=c.currency,
-        country=c.country,
-        portfolio_count=c.portfolio_count,
-        member_since=c.member_since,
         connected_at=c.connected_at,
-        last_synced_at=c.last_synced_at,
+        is_selected=profile.is_selected if profile else False,
+        rating=profile.rating if profile else None,
+        total_reviews=profile.total_reviews if profile else None,
+        avatar_url=_avatar(profile) if profile else None,
+        display_name=profile.display_name if profile else None,
+        tagline=profile.tagline if profile else None,
+        summary=profile.summary if profile else None,
+        account_skills=(profile.account_skills or []) if profile else [],
+        hourly_rate=profile.hourly_rate if profile else None,
+        currency=profile.currency if profile else None,
+        country=profile.country if profile else None,
+        portfolio_count=profile.portfolio_count if profile else None,
+        member_since=profile.member_since if profile else None,
+        last_synced_at=profile.last_synced_at if profile else None,
     )
 
 
 @router.get("/profiles", response_model=list[ProfileCard])
 async def list_profiles(session: AsyncSession = Depends(get_session)) -> list[ProfileCard]:
-    """Every profile on this account.
+    """Every profile on this account — one per connected marketplace account.
 
-    One today — the model is 1:1 with a user — but returning a list means an agency with several
-    operating profiles doesn't need a different endpoint later.
+    Selected first, then oldest, so the account switcher has a stable order and the scoped account
+    leads.
     """
     user = await get_or_create_default_user(session)
-    profile = await get_or_create_profile(session, user.id)
-    card = await _card(session, profile, user)
-    card.pop("_connections")
-    return [ProfileCard(**card)]
+    profiles = (
+        await session.scalars(
+            select(FreelancerProfile)
+            .where(FreelancerProfile.user_id == user.id)
+            .order_by(
+                FreelancerProfile.is_selected.desc(), FreelancerProfile.created_at.asc()
+            )
+        )
+    ).all()
+    if not profiles:
+        profiles = [await get_or_create_profile(session, user.id)]
+
+    cards: list[ProfileCard] = []
+    for profile in profiles:
+        card = await _card(session, profile, user)
+        card.pop("_connection")
+        cards.append(ProfileCard(**card))
+    return cards
 
 
 @router.get("/profiles/{profile_id}", response_model=ProfileDetail)
@@ -197,7 +242,8 @@ async def get_profile(
         raise HTTPException(status_code=404, detail="Profile not found")
 
     card = await _card(session, profile, user)
-    connections = card.pop("_connections")
+    connection = card.pop("_connection")
+    config = profile.config
 
     avg = await session.scalar(
         select(func.avg(Recommendation.score)).where(
@@ -206,6 +252,12 @@ async def get_profile(
         )
     )
 
+    # The one account this profile mirrors, as a list for a stable response shape.
+    connections = []
+    if connection is not None and connection.disconnected_at is None:
+        props, wins = await _connection_counts(session, connection)
+        connections = [_connection_out(connection, profile, proposals=props, wins=wins)]
+
     return ProfileDetail(
         **card,
         bio=profile.bio,
@@ -213,20 +265,17 @@ async def get_profile(
         portfolio=profile.portfolio or [],
         experience=profile.experience or [],
         education=profile.education or [],
-        keywords_include=profile.keywords_include or [],
-        keywords_exclude=profile.keywords_exclude or [],
+        keywords_include=config.keywords_include or [],
+        keywords_exclude=config.keywords_exclude or [],
         fixed_project_min=profile.fixed_project_min,
-        crowded_at_bids=profile.crowded_at_bids,
-        min_match_score=profile.min_match_score,
-        weight_skills=profile.weight_skills,
-        weight_budget=profile.weight_budget,
-        weight_competition=profile.weight_competition,
-        weight_recency=profile.weight_recency,
+        crowded_at_bids=config.crowded_at_bids,
+        min_match_score=config.min_match_score,
+        weight_skills=config.weight_skills,
+        weight_budget=config.weight_budget,
+        weight_competition=config.weight_competition,
+        weight_recency=config.weight_recency,
         proposal_notes=profile.proposal_notes,
-        connections=[
-            _connection_out(c)
-            for c in connections
-        ],
+        connections=connections,
         avg_score=round(float(avg), 1) if avg is not None else None,
         created_at=profile.created_at,
         updated_at=profile.updated_at,
@@ -237,13 +286,50 @@ async def get_profile(
 
 
 
+# ProfileIn fields that live on the config table rather than the profile itself.
+_CONFIG_FIELDS = frozenset(
+    {
+        "keywords_include",
+        "keywords_exclude",
+        "crowded_at_bids",
+        "min_match_score",
+        "weight_skills",
+        "weight_budget",
+        "weight_competition",
+        "weight_recency",
+    }
+)
+
+
 def _out(profile: FreelancerProfile) -> ProfileOut:
     synced = profile.last_synced_at
     if synced is not None and synced.tzinfo is None:
         synced = synced.replace(tzinfo=dt.UTC)
     stale = synced is None or (utcnow() - synced) > STALE_AFTER
-    return ProfileOut.model_validate(profile, from_attributes=True).model_copy(
-        update={"sync_is_stale": stale}
+    config = profile.config
+    # Built flat from two tables: the wire shape the edit form reads stays as it was, even though
+    # the scoring knobs now live on ``profile.config``.
+    return ProfileOut(
+        display_name=profile.display_name,
+        headline=profile.headline,
+        skills=profile.skills or [],
+        keywords_include=config.keywords_include or [],
+        keywords_exclude=config.keywords_exclude or [],
+        fixed_project_min=profile.fixed_project_min,
+        rate_min=profile.rate_min,
+        currency=profile.currency,
+        country=profile.country,
+        crowded_at_bids=config.crowded_at_bids,
+        min_match_score=config.min_match_score,
+        weight_skills=config.weight_skills,
+        weight_budget=config.weight_budget,
+        weight_competition=config.weight_competition,
+        weight_recency=config.weight_recency,
+        proposal_notes=profile.proposal_notes,
+        suggested_skills=profile.suggested_skills or [],
+        last_synced_at=profile.last_synced_at,
+        updated_at=profile.updated_at,
+        sync_is_stale=stale,
     )
 
 
@@ -264,11 +350,13 @@ async def update_profile(
     """
     user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
+    config = profile.config
 
     data = payload.model_dump()
     data["skills"] = [s for s in data["skills"] if s.get("name")]
     for key, value in data.items():
-        setattr(profile, key, value)
+        # Scoring knobs live on the config table; everything else on the profile itself.
+        setattr(config if key in _CONFIG_FIELDS else profile, key, value)
 
     await session.commit()
     await session.refresh(profile)
@@ -289,14 +377,6 @@ async def suggest_profile_skills(session: AsyncSession = Depends(get_session)) -
     user = await get_or_create_default_user(session)
     profile = await get_or_create_profile(session, user.id)
 
-    connections = (
-        await session.scalars(
-            select(PlatformConnection).where(
-                PlatformConnection.user_id == user.id,
-                PlatformConnection.disconnected_at.is_(None),
-            )
-        )
-    ).all()
     proposal_texts = (
         await session.scalars(
             select(Proposal.proposal_text)
@@ -307,7 +387,7 @@ async def suggest_profile_skills(session: AsyncSession = Depends(get_session)) -
     ).all()
 
     try:
-        suggestions = await suggest_skills(profile, list(connections), list(proposal_texts))
+        suggestions = await suggest_skills(profile, list(proposal_texts))
     except SkillSuggestError as exc:
         # A user pressed a button; a clear failure beats a silent empty list.
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -407,7 +487,7 @@ async def sync_everything(
 
     board = await run_cycle(session, trigger="manual")
     # A failed board fetch must not stop the bid pull: they are independent.
-    bids = await sync_bids(session, user.id, profile)
+    bids = await sync_bids(session, user.id)
 
     await session.refresh(profile)
     return FullSyncOut(
@@ -441,26 +521,8 @@ async def list_connections(session: AsyncSession = Depends(get_session)) -> list
     ).all()
     out: list[ConnectionOut] = []
     for c in rows:
-        placed = (
-            await session.scalar(
-                select(func.count(Proposal.id)).where(Proposal.connection_id == c.id)
-            )
-            or 0
-        )
-        won = (
-            await session.scalar(
-                select(func.count(Proposal.id)).where(
-                    Proposal.connection_id == c.id,
-                    Proposal.status == ProposalStatus.ACCEPTED,
-                )
-            )
-            or 0
-        )
-        out.append(
-            _connection_out(
-                c, proposals=placed, wins=won, selected=c.is_selected
-            )
-        )
+        placed, won = await _connection_counts(session, c)
+        out.append(_connection_out(c, c.profile, proposals=placed, wins=won))
     return out
 
 
@@ -475,6 +537,7 @@ async def select_connection(
     """
     user = await get_or_create_default_user(session)
 
+    owned: PlatformConnection | None = None
     if payload.connection_id is not None:
         owned = await session.scalar(
             select(PlatformConnection).where(
@@ -487,19 +550,17 @@ async def select_connection(
         if owned is None:
             raise HTTPException(status_code=404, detail="No such connection.")
 
-    # Clear first, then set: the partial unique index rejects a second selected row, so the two
-    # statements have to be in this order within the transaction.
+    # Selection lives on the profile now. Clear first, then set: the partial unique index rejects a
+    # second selected row, so the two statements have to be in this order within the transaction.
     await session.execute(
-        update(PlatformConnection)
-        .where(PlatformConnection.user_id == user.id, PlatformConnection.is_selected.is_(True))
+        update(FreelancerProfile)
+        .where(FreelancerProfile.user_id == user.id, FreelancerProfile.is_selected.is_(True))
         .values(is_selected=False)
     )
-    if payload.connection_id is not None:
-        await session.execute(
-            update(PlatformConnection)
-            .where(PlatformConnection.id == payload.connection_id)
-            .values(is_selected=True)
-        )
+    await session.flush()
+    if owned is not None:
+        profile = owned.profile or await get_or_create_profile_for_connection(session, owned)
+        profile.is_selected = True
     await session.commit()
     return await list_connections(session)
 
@@ -527,19 +588,28 @@ async def remove_connection(
     if connection is None:
         raise HTTPException(status_code=404, detail="Connection not found")
 
-    was_selected = connection.is_selected
+    # Selection lives on the profile now. A disconnected account's profile can't be the scoped one.
+    profile = connection.profile
+    was_selected = bool(profile and profile.is_selected)
+    if profile is not None:
+        profile.is_selected = False
     disconnect_connection(connection)
 
     # If the account the app was scoped to is the one being removed, move the scope to another
-    # connected account rather than silently dropping to "all accounts". Flush first so the removed
-    # row's cleared selection (and its disconnected_at) lands before we pick a replacement — the
-    # partial unique index allows only one selected row at a time.
+    # still-connected account's profile rather than silently dropping to "all accounts". Flush first
+    # so the removed connection's disconnected_at lands before we pick a replacement — the partial
+    # unique index allows only one selected profile at a time.
     if was_selected:
         await session.flush()
         remaining = (
             await session.scalars(
-                select(PlatformConnection).where(
-                    PlatformConnection.user_id == user.id,
+                select(FreelancerProfile)
+                .join(
+                    PlatformConnection,
+                    PlatformConnection.id == FreelancerProfile.connection_id,
+                )
+                .where(
+                    FreelancerProfile.user_id == user.id,
                     PlatformConnection.disconnected_at.is_(None),
                 )
             )

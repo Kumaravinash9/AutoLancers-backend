@@ -10,7 +10,6 @@ class TestDisconnect:
     def _connected(self) -> PlatformConnection:
         return PlatformConnection(
             status="ACTIVE",
-            is_selected=True,
             access_token_encrypted="enc-access",
             refresh_token_encrypted="enc-refresh",
         )
@@ -27,8 +26,3 @@ class TestDisconnect:
         # We have no business holding an access or refresh token for a disconnected account.
         assert c.access_token_encrypted is None
         assert c.refresh_token_encrypted is None
-
-    def test_drops_selection(self):
-        c = self._connected()
-        disconnect_connection(c)
-        assert c.is_selected is False

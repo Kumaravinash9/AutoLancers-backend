@@ -23,7 +23,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.freelancer_oauth import OAuthError, get_valid_access_token
-from app.connectors.freelancer import FreelancerAPIError, FreelancerClient, JobPosting
+from app.connectors import create_connector
+from app.connectors.freelancer import FreelancerAPIError, JobPosting
 from app.db.models import (
     DiscoveryMethod,
     FreelancerProfile,
@@ -37,6 +38,7 @@ from app.db.models import (
     utcnow,
 )
 from app.services.scoring import score_job
+from app.services.users import get_or_create_profile_for_connection
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +69,7 @@ class SyncReport:
         return self.__dict__.copy()
 
 
-async def sync_bids(
-    session: AsyncSession, user_id: uuid.UUID, profile: FreelancerProfile
-) -> SyncReport:
+async def sync_bids(session: AsyncSession, user_id: uuid.UUID) -> SyncReport:
     report = SyncReport()
 
     connections = (
@@ -85,12 +85,14 @@ async def sync_bids(
         report.error = "No freelancer account connected."
         return report
 
-    # Every connected account contributes its own bids. Syncing only the first would silently
-    # under-report someone operating two.
+    # Every connected account contributes its own bids to its own profile. Syncing only the first
+    # would silently under-report someone operating two, and attributing them all to one profile
+    # would mix two accounts' win rates.
     for connection in connections:
+        profile = await get_or_create_profile_for_connection(session, connection)
         await _sync_one(session, user_id, profile, connection, report)
+        profile.bids_synced_at = utcnow()
 
-    profile.bids_synced_at = utcnow()
     await session.commit()
     logger.info("Bid sync: %s", report.as_dict())
     return report
@@ -109,7 +111,7 @@ async def _sync_one(
         report.error = str(exc)
         return report
 
-    client = FreelancerClient(access_token=token)
+    client = create_connector(connection.platform, access_token=token)
 
     try:
         me = await client.fetch_self()
@@ -117,6 +119,11 @@ async def _sync_one(
         if not bidder_id:
             raise FreelancerAPIError("Could not read own user id")
         await _store_identity(session, profile, connection, me)
+        # Portfolio items come from their own endpoint; a failure here is non-fatal to the bid sync.
+        try:
+            profile.portfolio = await client.fetch_portfolio(bidder_id)
+        except FreelancerAPIError as exc:
+            logger.warning("Could not fetch portfolio for %s: %s", connection.id, exc)
         bids = await client.fetch_my_bids(bidder_id)
     except FreelancerAPIError as exc:
         report.error = str(exc)
@@ -323,8 +330,6 @@ def _as_int(value: Any) -> int | None:
 
 
 def _as_datetime(value: Any):
-    import datetime as dt
-
     if isinstance(value, int | float):
         return dt.datetime.fromtimestamp(value, tz=dt.UTC)
     return None
@@ -336,76 +341,24 @@ async def _store_identity(
     connection: PlatformConnection,
     me: dict[str, Any],
 ) -> None:
-    """Save the marketplace's own view of this account: picture, handle, rating and public profile.
+    """Mirror the marketplace's own view of this account onto its profile, and refresh the
+    connection's identity fields.
 
-    Freelancer serves several avatar sizes; prefer the large CDN one, since an image scaled down
-    looks better than one scaled up.
-
-    Every connection field here is overwritten from the marketplace on each sync, deliberately —
-    this is a mirror of what clients see there, not something editable on our side. The freelancer's
-    home country and currency are also mirrored onto ``profile`` (see ``_mirror_home_to_profile``),
-    which is where the rest of the app reads them.
+    Overwritten from the marketplace on each sync, deliberately — this is a mirror of what clients
+    see there, not something editable on our side. Currency is adopted only while no budget floor
+    has been set: once the freelancer has entered floors, the currency those numbers are stated in
+    is theirs to change, not the sync's to silently reinterpret.
     """
-    avatar = (
-        me.get("avatar_large_cdn")
-        or me.get("avatar_cdn")
-        or me.get("avatar_large")
-        or me.get("avatar")
-    )
-    if avatar:
-        # The API returns protocol-relative URLs in places; a bare //host path won't load.
-        connection.avatar_url = f"https:{avatar}" if avatar.startswith("//") else avatar
+    from app.connectors.freelancer import self_profile_fields
 
+    # Identity stays on the connection; the rest describes the account and lives on the profile.
     connection.platform_user_id = str(me.get("id") or "") or connection.platform_user_id
     connection.platform_username = me.get("username") or connection.platform_username
 
-    reputation = (me.get("reputation") or {}).get("entire_history") or {}
-    if reputation.get("overall") is not None:
-        connection.rating = float(reputation["overall"])
-    if reputation.get("reviews") is not None:
-        connection.total_reviews = int(reputation["reviews"])
-
-    connection.display_name = me.get("public_name") or me.get("display_name")
-    connection.tagline = me.get("tagline")
-    connection.summary = me.get("profile_description")
-    connection.account_skills = [
-        job["name"] for job in (me.get("jobs") or []) if isinstance(job, dict) and job.get("name")
-    ]
-    connection.hourly_rate = _as_float(me.get("hourly_rate"))
-    connection.currency = (me.get("primary_currency") or {}).get("code")
-    connection.country = ((me.get("location") or {}).get("country") or {}).get("name")
-    connection.portfolio_count = _as_int(me.get("portfolio_count"))
-
-    registered = me.get("registration_date")
-    if isinstance(registered, int | float):
-        connection.member_since = dt.datetime.fromtimestamp(registered, tz=dt.UTC)
-
-    connection.last_synced_at = utcnow()
-
-    _mirror_home_to_profile(profile, connection)
-
-
-def _mirror_home_to_profile(profile: FreelancerProfile, connection: PlatformConnection) -> None:
-    """Copy the account's home country/currency onto the profile, which is where the rest of the app
-    reads them (scoring floors and the local-currency display).
-
-    Only from the account the app is scoped to — or the first one to arrive, so a fresh profile gets
-    populated. Currency is adopted only while no budget floor has been set: once the freelancer has
-    entered floors, the currency those numbers are stated in is theirs to change, not the sync's to
-    silently reinterpret.
-    """
-    if not connection.is_selected and profile.country:
-        return  # a non-selected account doesn't override an already-populated home
-    if connection.country:
-        profile.country = connection.country
-    # Falsy (0 or an unset None) means no floor entered yet — safe to adopt the account currency.
-    if connection.currency and not profile.rate_min and not profile.fixed_project_min:
-        profile.currency = connection.currency
-
-
-def _as_float(value: Any) -> float | None:
-    return float(value) if isinstance(value, int | float) else None
-
-
-def _as_int(value: Any) -> int | None:
-    return int(value) if isinstance(value, int | float) else None
+    fields = self_profile_fields(me)
+    currency = fields.pop("currency", None)
+    for key, value in fields.items():
+        setattr(profile, key, value)
+    if currency and not profile.rate_min and not profile.fixed_project_min:
+        profile.currency = currency
+    profile.last_synced_at = utcnow()

@@ -172,5 +172,4 @@ async def sync(session: AsyncSession = Depends(get_session)) -> dict[str, object
     can know that.
     """
     user = await get_or_create_default_user(session)
-    profile = await get_or_create_profile(session, user.id)
-    return (await sync_bids(session, user.id, profile)).as_dict()
+    return (await sync_bids(session, user.id)).as_dict()

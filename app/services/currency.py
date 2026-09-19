@@ -62,7 +62,9 @@ def _rate(currency: str | None) -> float | None:
     return _USD_RATES.get(currency.strip().upper())
 
 
-def convert(amount: float | None, from_currency: str | None, to_currency: str | None) -> float | None:
+def convert(
+    amount: float | None, from_currency: str | None, to_currency: str | None
+) -> float | None:
     """Convert ``amount`` from one currency to another.
 
     Returns ``None`` when the amount is missing or either currency is unknown — the caller decides

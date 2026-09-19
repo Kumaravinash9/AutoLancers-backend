@@ -30,22 +30,86 @@ GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{mode
 # sizing this for the JSON alone returns an empty response.
 MAX_OUTPUT_TOKENS = 8000
 
+# A listing page is up to sixty jobs in one answer, and the run is aborted rather than truncated
+# when the budget is hit — so the list kinds get their own ceiling instead of failing on page two.
+MAX_OUTPUT_TOKENS_LIST = 32_000
+
 # Enough of the page to cover a full profile; beyond this is footer boilerplate.
 MAX_INPUT_CHARS = 30_000
 
-_SYSTEM_PROMPT = (
-    "# Role\n"
-    "You extract structured data from the visible text of a freelancing marketplace page.\n"
-    "\n"
-    "# Constraints\n"
-    "- Report only what the text states. Never infer, complete, or guess a value.\n"
-    "- If a field is not present, return null for it (or an empty list). An absent field is a "
-    "correct answer; a plausible invention is not.\n"
-    "- Ignore navigation, cookie banners, upsells, tooltips and footer links. They are page "
-    "furniture, not content about this person or job.\n"
-    "- Numbers must be plain: '$40K' becomes 40000, '1,240' becomes 1240, '98%' becomes 98.\n"
-    "- Copy names, titles and skills exactly as written. Do not translate or tidy them.\n"
-)
+# A listing page of sixty jobs is several times a profile's length, and truncating the input drops
+# the last jobs silently — they simply never appear in the answer.
+MAX_INPUT_CHARS_LIST = 120_000
+
+# The prompt is structured — Role, Task, Context, Constraints, Result, Output — because each
+# section answers a different question the model would otherwise have to guess at. The section doing
+# the most work is Context: it tells the model *what happens to its answer*, which is what makes
+# "null" a comfortable reply rather than a failure to be avoided. A model that believes it must
+# produce a value will produce one.
+#
+# A triple-quoted string, not concatenated literals: a long prompt assembled from adjacent string
+# fragments loses a word boundary the moment someone rewraps a line, and the result is a subtly
+# mangled instruction that still looks fine in the source.
+_SYSTEM_PROMPT = """# Role
+
+You read the visible text of a freelancing marketplace page and report what it states. You are a
+careful reader, not an assistant: you are not asked to be helpful, complete, or confident.
+
+# Task
+
+Return the fields defined by the response schema, filled only from the page text you are given.
+
+# Context
+
+You are the second reader of this page. CSS selectors read it first and already captured everything
+they could identify. You are being asked because some fields came back empty.
+
+Two consequences follow, and they are the reason for every constraint below.
+
+1. A value you return is only ever used to fill a field that is currently EMPTY. It can never
+   correct or replace a value that was already captured. So a field you get wrong cannot be fixed
+   afterwards by anything — not by another model, not by a better selector. It stays wrong.
+2. A field you leave null is handled correctly downstream. The system reads null as "unknown" and
+   skips the filter that would have used it. Nothing breaks and nothing is lost.
+
+A null therefore costs nothing and a guess costs everything. When you are not certain, null is not
+a failure — it is the accurate answer, and it is the one this system is built to receive.
+
+# Constraints
+
+- Report only what the text states. Never infer, complete, calculate or guess a value.
+- Return null for any field the text does not state, and an empty list for any absent list. Do not
+  substitute 0, "N/A", "Unknown", an empty string, or a plausible default.
+- Do not use knowledge from outside the page text. Knowing a marketplace's usual figure is not
+  evidence about this page.
+- Ignore navigation, cookie banners, upsells, tooltips, related listings and footer links. They are
+  page furniture, not content about this person or job.
+- Copy names, titles and skills exactly as written. Do not translate, tidy, expand or de-duplicate
+  them. Titles are used to match your answer back to the row it describes, so an improved title
+  breaks that match.
+- Numbers must be plain: "$40K" becomes 40000, "1,240" becomes 1240, "98%" becomes 98.
+- Currency must be the ISO code for the symbol actually shown: £ is GBP, $ is USD, € is EUR, ₹ is
+  INR. If no symbol appears beside the figure, return null. Never a default.
+- work_type is lowercase "hourly" or "fixed", and only when the page says which. A budget with no
+  stated type is not evidence of either.
+- For dates, copy the page's own wording, including relative wording like "3 hours ago". The server
+  resolves it against the moment the page was read. Do not compute a date yourself: you do not know
+  when this page was captured.
+- Where a figure and its label sit together — "from 23 reviews", "Total hours 2,410" — the figure
+  belongs to the label beside it. Do not attach a number to a nearby label it does not belong to.
+
+# Result
+
+A reading that is correct where it is filled and null where it is not. Partial and accurate beats
+complete and uncertain. A response of all nulls is a valid and useful answer if the page genuinely
+says nothing.
+
+# Output format
+
+JSON matching the response schema exactly. No prose, no explanation, no markdown fence, no
+commentary about what you could not find. Every schema key present, using null or [] where the page
+does not state a value. Add no keys of your own.
+"""
 
 _PROFILE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -146,7 +210,129 @@ _JOB_SCHEMA: dict[str, Any] = {
     "required": ["title", "skills"],
 }
 
-SCHEMAS = {"profile": _PROFILE_SCHEMA, "job": _JOB_SCHEMA}
+
+# The four ``projects`` columns the job schema above has no field for, added rather than duplicated
+# so the list schema below and the single-job schema cannot drift apart.
+_JOB_SCHEMA["properties"].update(
+    {
+        "required_skills": {"type": "array", "items": {"type": "string"}},
+        "min_budget": {"type": "number", "nullable": True},
+        "max_budget": {"type": "number", "nullable": True},
+        "posted_at": {"type": "string", "nullable": True},
+        "bid_count": {"type": "number", "nullable": True},
+        "client_name": {"type": "string", "nullable": True},
+        "client_rating": {"type": "number", "nullable": True},
+        "client_country": {"type": "string", "nullable": True},
+        "client_reviews_count": {"type": "number", "nullable": True},
+        "client_total_spent": {"type": "number", "nullable": True},
+        "client_payment_verified": {"type": "boolean", "nullable": True},
+    }
+)
+
+# A listing page holds many jobs, so the list kinds return an array under ``items``. ``title`` stays
+# required on every item because it is the only key available for matching a reading back to the
+# scraped row it describes — ids live in hrefs, and the model only ever sees the visible text.
+_JOBS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": _JOB_SCHEMA}},
+    "required": ["items"],
+}
+
+_PROPOSALS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "project_title": {"type": "string"},
+                    "external_bid_id": {"type": "string", "nullable": True},
+                    # Mapped onto this app's vocabulary, because every marketplace words it
+                    # differently: PeoplePerHour's "Awaiting response" is SUBMITTED, its
+                    # "Not selected" is REJECTED.
+                    "status": {
+                        "type": "string",
+                        "nullable": True,
+                        "enum": ["DRAFT", "SUBMITTED", "ACCEPTED", "REJECTED", "WITHDRAWN"],
+                    },
+                    "bid_amount": {"type": "number", "nullable": True},
+                    "currency": {"type": "string", "nullable": True},
+                    "estimated_days": {"type": "number", "nullable": True},
+                    "submitted_at": {"type": "string", "nullable": True},
+                    "client_name": {"type": "string", "nullable": True},
+                },
+                "required": ["project_title"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+_CONTRACTS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "client_name": {"type": "string", "nullable": True},
+                    "work_type": {"type": "string", "nullable": True},
+                    "status": {
+                        "type": "string",
+                        "nullable": True,
+                        "enum": ["ACTIVE", "PAUSED", "ENDED"],
+                    },
+                    "rate": {"type": "number", "nullable": True},
+                    "currency": {"type": "string", "nullable": True},
+                    "earned_to_date": {"type": "number", "nullable": True},
+                    "hours_logged": {"type": "number", "nullable": True},
+                    "started_at": {"type": "string", "nullable": True},
+                    "ended_at": {"type": "string", "nullable": True},
+                },
+                "required": ["title"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+SCHEMAS = {
+    "profile": _PROFILE_SCHEMA,
+    "job": _JOB_SCHEMA,
+    "jobs": _JOBS_SCHEMA,
+    "proposals": _PROPOSALS_SCHEMA,
+    "contracts": _CONTRACTS_SCHEMA,
+}
+
+# Every kind whose result is a list of items rather than one object.
+LIST_KINDS = frozenset({"jobs", "proposals", "contracts"})
+
+# What to ask for, per kind. The list kinds need "every one you can see, and no others" said
+# explicitly: a model handed an array to fill will pad it if the instruction only implies a count.
+_INSTRUCTIONS = {
+    "profile": "Extract the freelancer profile described by this marketplace page.",
+    "job": "Extract the job described by this marketplace page.",
+    "jobs": (
+        "Extract every job listed on this page, one item per job, in the order they appear. "
+        "Copy each title exactly as written — the title is how each item is matched back to the "
+        "listing it came from. Do not add a job that is not on the page, and do not merge two."
+    ),
+    "proposals": (
+        "Extract every proposal or bid listed on this page, one item per row. `project_title` is "
+        "the job the proposal was for. Map the marketplace's own wording onto the status values: "
+        "awaiting a reply is SUBMITTED, hired or awarded is ACCEPTED, not selected or declined is "
+        "REJECTED, withdrawn by the freelancer is WITHDRAWN, unsent is DRAFT. Never return the "
+        "proposal's own text — a listing shows only a truncated preview of it."
+    ),
+    "contracts": (
+        "Extract every contract, order or ongoing project listed on this page, one item per row. "
+        "A contract still being worked is ACTIVE, one on hold is PAUSED, a finished or closed one "
+        "is ENDED. Money already paid goes in `earned_to_date`, the agreed rate or price in `rate`."
+    ),
+}
 
 
 class PageParseError(RuntimeError):
@@ -159,14 +345,27 @@ _SYMBOLS = {"$": "USD", "£": "GBP", "€": "EUR", "₹": "INR", "¥": "JPY"}
 
 
 def _normalise(fields: dict[str, Any]) -> None:
-    """In-place tidy-ups the schema can't express."""
+    """In-place tidy-ups the schema can't express.
+
+    Walks into ``items`` for the list kinds: a per-row currency symbol needs the same treatment as a
+    top-level one, and skipping it would leave "$" sitting in a column compared against "USD".
+    """
     currency = fields.get("currency")
     if isinstance(currency, str):
         fields["currency"] = _SYMBOLS.get(currency.strip(), currency.strip().upper() or None)
 
+    for item in fields.get("items") or []:
+        if isinstance(item, dict):
+            _normalise(item)
+
 
 async def parse_page(kind: str, text: str) -> dict[str, Any]:
-    """Extract fields of ``kind`` ('profile' or 'job') from page text."""
+    """Extract fields of ``kind`` from page text.
+
+    ``kind`` is one of :data:`SCHEMAS` — a single ``profile`` or ``job``, or one of the
+    :data:`LIST_KINDS` (``jobs``, ``proposals``, ``contracts``) whose ``fields`` carry an ``items``
+    array instead of one object.
+    """
     schema = SCHEMAS.get(kind)
     if schema is None:
         raise PageParseError(f"Unknown page kind {kind!r}")
@@ -176,28 +375,33 @@ async def parse_page(kind: str, text: str) -> dict[str, Any]:
         raise PageParseError("The page text was too short to read anything from.")
 
     settings = get_settings()
-    truncated = body[:MAX_INPUT_CHARS]
+    listing = kind in LIST_KINDS
+    input_cap = MAX_INPUT_CHARS_LIST if listing else MAX_INPUT_CHARS
+    output_cap = MAX_OUTPUT_TOKENS_LIST if listing else MAX_OUTPUT_TOKENS
+    truncated = body[:input_cap]
     message = (
-        f"Extract the {kind} described by this marketplace page.\n\n"
+        f"{_INSTRUCTIONS.get(kind, f'Extract the {kind} described by this marketplace page.')}\n\n"
         f"<page_text>\n{truncated}\n</page_text>"
     )
 
     provider = (settings.llm_provider or "gemini").lower()
     if provider == "nvidia":
-        result = await _parse_openai_compatible(message, schema)
+        result = await _parse_openai_compatible(message, schema, output_cap)
     elif provider in ("gemini", "anthropic"):
         # Anthropic has no structured-output mode here yet, and Gemini's is the one this was built
         # against — so it handles both rather than silently doing something different.
-        result = await _parse_gemini(message, schema)
+        result = await _parse_gemini(message, schema, output_cap)
     else:
         raise PageParseError(f"Unknown LLM_PROVIDER {settings.llm_provider!r}")
 
     _normalise(result["fields"])
-    result["truncated_input"] = len(body) > MAX_INPUT_CHARS
+    result["truncated_input"] = len(body) > input_cap
     return result
 
 
-async def _parse_openai_compatible(message: str, schema: dict[str, Any]) -> dict[str, Any]:
+async def _parse_openai_compatible(
+    message: str, schema: dict[str, Any], max_output_tokens: int = MAX_OUTPUT_TOKENS
+) -> dict[str, Any]:
     """Any OpenAI-compatible chat endpoint that honours ``response_format: json_schema``."""
     settings = get_settings()
     if not settings.nvidia_api_key:
@@ -209,7 +413,7 @@ async def _parse_openai_compatible(message: str, schema: dict[str, Any]) -> dict
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": message},
         ],
-        "max_tokens": MAX_OUTPUT_TOKENS,
+        "max_tokens": max_output_tokens,
         "temperature": 0,
         "response_format": {
             "type": "json_schema",
@@ -266,7 +470,9 @@ def _loads(raw: str) -> dict[str, Any]:
         raise PageParseError(f"The model returned unparseable JSON: {exc}") from exc
 
 
-async def _parse_gemini(message: str, schema: dict[str, Any]) -> dict[str, Any]:
+async def _parse_gemini(
+    message: str, schema: dict[str, Any], max_output_tokens: int = MAX_OUTPUT_TOKENS
+) -> dict[str, Any]:
     settings = get_settings()
     if not settings.gemini_api_key:
         raise PageParseError("GEMINI_API_KEY is not set.")
@@ -275,7 +481,7 @@ async def _parse_gemini(message: str, schema: dict[str, Any]) -> dict[str, Any]:
         "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": message}]}],
         "generationConfig": {
-            "maxOutputTokens": MAX_OUTPUT_TOKENS,
+            "maxOutputTokens": max_output_tokens,
             "responseMimeType": "application/json",
             "responseSchema": schema,
         },

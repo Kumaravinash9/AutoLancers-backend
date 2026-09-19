@@ -143,15 +143,17 @@ async def store_token(
     second Freelancer account would overwrite the first — the two are indistinguishable until you
     ask.
     """
-    from app.connectors.freelancer import FreelancerAPIError, FreelancerClient
+    from app.connectors import ConnectorError, create_connector
+    from app.connectors.freelancer import self_profile_fields
 
     account_id: str | None = None
     username: str | None = None
+    me: dict | None = None
     try:
-        me = await FreelancerClient(access_token=token.access_token).fetch_self()
+        me = await create_connector(platform, access_token=token.access_token).fetch_self()
         account_id = str(me.get("id") or "") or None
         username = me.get("username")
-    except FreelancerAPIError:
+    except ConnectorError:
         # A token we can't identify is still worth storing; it just can't be told apart yet.
         pass
 
@@ -188,7 +190,43 @@ async def store_token(
 
     await session.commit()
     await session.refresh(existing)
+
+    # Mirror the account's public profile onto its 1:1 profile. ``fetch_self`` was already called
+    # above for identity; using the rest of it here is free. A fetch that failed leaves ``me`` None,
+    # in which case there's nothing to mirror and the stored token still stands.
+    if me is not None:
+        from app.services.users import get_or_create_profile_for_connection
+
+        profile = await get_or_create_profile_for_connection(session, existing)
+        _mirror_self_onto_profile(profile, me, self_profile_fields(me))
+        # Portfolio items live on their own endpoint (self/ only carries a count). A bonus, so a
+        # failure here must not block storing the token.
+        if account_id:
+            try:
+                profile.portfolio = await create_connector(
+                    platform, access_token=token.access_token
+                ).fetch_portfolio(int(account_id))
+            except ConnectorError:
+                pass
+        await session.commit()
+        await session.refresh(existing)
+
     return existing
+
+
+def _mirror_self_onto_profile(profile, me: dict, fields: dict) -> None:
+    """Write the mapped self-profile fields onto ``profile``, then stamp the sync time.
+
+    Currency is adopted only while no budget floor has been set: once the freelancer has entered
+    floors, the currency those numbers are stated in is theirs to change, not the sync's to silently
+    reinterpret.
+    """
+    currency = fields.pop("currency", None)
+    for key, value in fields.items():
+        setattr(profile, key, value)
+    if currency and not profile.rate_min and not profile.fixed_project_min:
+        profile.currency = currency
+    profile.last_synced_at = utcnow()
 
 
 async def get_valid_access_token(

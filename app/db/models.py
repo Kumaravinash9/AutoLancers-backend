@@ -36,6 +36,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from app.connectors.base import ConnectorKind
+
 
 def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
@@ -139,8 +141,10 @@ class User(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    profile: Mapped[FreelancerProfile | None] = relationship(
-        back_populates="user", uselist=False, cascade="all, delete-orphan"
+    # One profile per connected marketplace account (plus, for a fresh account, one connection-less
+    # default). Was 1:1 with the user; became 1:N when the marketplace profile moved onto it.
+    profiles: Mapped[list[FreelancerProfile]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
     )
     connections: Mapped[list[PlatformConnection]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
@@ -152,11 +156,12 @@ class User(Base):
 
 
 class PlatformConnection(Base):
-    """A user's OAuth link to one marketplace.
+    """A user's OAuth link to one marketplace account — identity and credentials only.
 
-    Tokens hold Fernet ciphertext, never plaintext — read and write them through
-    ``app.auth.crypto``. Reputation lives here rather than on the profile because the same person
-    has different ratings on Freelancer.com and Upwork.
+    Tokens hold Fernet ciphertext, never plaintext — read and write them via ``app.auth.crypto``.
+    Everything a human or the scorer reads — the account's public profile, reputation, rates and
+    skills — lives on the :class:`FreelancerProfile` linked 1:1 to this connection, not here. The
+    connection is only *how we authenticate to and identify* one marketplace account.
     """
 
     __tablename__ = "platform_connections"
@@ -166,14 +171,6 @@ class PlatformConnection(Base):
         UniqueConstraint(
             "user_id", "platform", "platform_user_id", name="uq_connection_user_platform_account"
         ),
-        # At most one selected account per user. A partial index enforces that in the database
-        # rather than trusting every write path to clear the previous one first.
-        Index(
-            "uq_selected_connection_per_user",
-            "user_id",
-            unique=True,
-            postgresql_where=text("is_selected"),
-        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -182,41 +179,17 @@ class PlatformConnection(Base):
     platform: Mapped[str] = mapped_column(String(50), default="freelancer")
     platform_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     platform_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # How this account is connected — OAuth (tokens, pollable, can bid) or extension (paste-in
+    # mirror, no tokens). Stored as a string like the other enums here; see
+    # ``app.connectors.ConnectorKind``. Decides capabilities, not just labelling.
+    kind: Mapped[str] = mapped_column(String(20), default=ConnectorKind.OAUTH)
 
     access_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     refresh_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     scope: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    rating: Mapped[float | None] = mapped_column(Float, nullable=True)
-    total_reviews: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # The avatar as the marketplace serves it. Stored per connection rather than per user because
-    # the same person can present differently on Freelancer and Upwork.
-    avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # Which account the app is scoped to. All false means all accounts — a real state, not an
-    # unset one, so it is the default rather than something the user has to choose.
-    is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    # The account's own public profile, as the marketplace holds it — distinct from the
-    # ``freelancer_profiles`` row, which is our scoring configuration. Two Freelancer accounts run
-    # by the same person advertise different skills and rates, and that is what a client sees.
-    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    tagline: Mapped[str | None] = mapped_column(Text, nullable=True)
-    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    account_skills: Mapped[list[str]] = mapped_column(JSONB, default=list)
-    hourly_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
-    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    country: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    portfolio_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    member_since: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-
     connected_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     token_expires_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    last_synced_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     status: Mapped[str] = mapped_column(String(30), default="ACTIVE")
@@ -229,22 +202,74 @@ class PlatformConnection(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="connections")
+    # 1:1 — the profile that mirrors this account and carries its scoring config. Nullable on the
+    # profile side (a fresh account has a connection-less default profile); a purged connection
+    # leaves its profile behind with ``connection_id`` nulled rather than deleting bid history.
+    profile: Mapped[FreelancerProfile | None] = relationship(
+        back_populates="connection", uselist=False, lazy="selectin"
+    )
 
 
 class FreelancerProfile(Base):
-    """The matching and drafting profile. One per user.
+    """The hub: one per connected marketplace account (1:1 with a :class:`PlatformConnection`).
 
-    Scoring weights are explicit columns rather than keys inside a JSONB blob because they are the
-    tuning surface — the profile screen edits them directly, and burying them would make every
-    change a blind write.
+    Carries three things that used to be spread across two tables: the account's public marketplace
+    profile (name, avatar, reputation, rate, advertised skills — mirrored from the platform on each
+    sync), the freelancer's own curated content (bio, skills, portfolio), and the discovery/board
+    state. The *scoring tuning surface* (weights, thresholds, keyword filters) lives one hop away on
+    :class:`ProfileConfig`, so identity and tuning stay separable.
+
+    Recommendations and proposals hang off this row, so a person operating two accounts scores and
+    bids each independently.
     """
 
     __tablename__ = "freelancer_profiles"
+    __table_args__ = (
+        # At most one selected profile per user. A partial index enforces it in the database rather
+        # than trusting every write path to clear the previous one first.
+        Index(
+            "uq_selected_profile_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_selected"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _pk()
-    user_id: Mapped[uuid.UUID] = _fk("users.id", unique=True, index=True)
+    # No longer unique: a user has one profile per connected account.
+    user_id: Mapped[uuid.UUID] = _fk("users.id", index=True)
+    # 1:1 link to the marketplace account this profile mirrors. Null for the connection-less default
+    # a fresh account gets. SET NULL on delete so purging a connection keeps the profile (and its
+    # bid history) rather than cascading it away.
+    connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("platform_connections.id", ondelete="SET NULL"),
+        unique=True,
+        index=True,
+        nullable=True,
+    )
+    # Which profile the app is scoped to. All false means "all accounts" — a real state, not an
+    # unset one, so it is the default rather than something the user has to choose.
+    is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # --- the account's public profile, mirrored from the marketplace on each sync ---
     display_name: Mapped[str] = mapped_column(String(255), default="")
+    # The avatar as the marketplace serves it.
+    avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tagline: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Skills the marketplace account advertises (its job tags), distinct from the curated ``skills``
+    # below that drive matching. Evidence for skill suggestions, never a scoring input on its own.
+    account_skills: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    hourly_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_reviews: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    portfolio_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    member_since: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # --- the freelancer's own curated content ---
     headline: Mapped[str] = mapped_column(String(255), default="")
     bio: Mapped[str] = mapped_column(Text, default="")
 
@@ -270,18 +295,6 @@ class FreelancerProfile(Base):
     country: Mapped[str | None] = mapped_column(String(100), nullable=True)
     availability: Mapped[str] = mapped_column(String(30), default="FULL_TIME")
 
-    keywords_include: Mapped[list[str]] = mapped_column(JSONB, default=list)
-    keywords_exclude: Mapped[list[str]] = mapped_column(JSONB, default=list)
-    # The bid count at which competition scores half marks. Not a cap: a crowded posting loses
-    # points, it is never hidden. See ``scoring._score_competition``.
-    crowded_at_bids: Mapped[int] = mapped_column(Integer, default=25)
-    min_match_score: Mapped[float] = mapped_column(Float, default=55.0)
-
-    weight_skills: Mapped[float] = mapped_column(Float, default=60.0)
-    weight_budget: Mapped[float] = mapped_column(Float, default=20.0)
-    weight_competition: Mapped[float] = mapped_column(Float, default=10.0)
-    weight_recency: Mapped[float] = mapped_column(Float, default=10.0)
-
     # Resolved Freelancer skill IDs for the server-side discovery filter — the confirmed skills
     # broadened into the marketplace's tag vocabulary (see ``services.skill_expansion``). Cached
     # because computing it hits the LLM and the skill catalogue; ``search_skill_ids_key`` hashes
@@ -293,11 +306,8 @@ class FreelancerProfile(Base):
 
     proposal_notes: Mapped[str] = mapped_column(Text, default="")
 
-    # Tokenised reference only. Never raw card or bank details.
-    payment_provider_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-
-    # When this freelancer's board was last recalculated — distinct from a connection's
-    # last_synced_at, which tracks the last pull from that platform's API.
+    # When this profile's board was last recalculated, and when its account was last mirrored from
+    # the marketplace — the single "last synced" timestamp for this account.
     last_synced_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -320,7 +330,52 @@ class FreelancerProfile(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
 
-    user: Mapped[User] = relationship(back_populates="profile")
+    user: Mapped[User] = relationship(back_populates="profiles")
+    # Eager-loaded so read paths can reach the account's platform/identity without an async lazy
+    # load mid-request.
+    connection: Mapped[PlatformConnection | None] = relationship(
+        back_populates="profile", lazy="selectin"
+    )
+    # The scoring tuning surface, split off so identity and tuning stay separable. Created with the
+    # profile and deleted with it. Eager-loaded because ``services.scoring`` runs synchronously and
+    # reads ``profile.config`` — a lazy load there would trip async SQLAlchemy's greenlet guard.
+    config: Mapped[ProfileConfig] = relationship(
+        back_populates="profile", uselist=False, cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class ProfileConfig(Base):
+    """The scoring tuning surface for one profile — the knobs the profile screen edits directly.
+
+    Split out from :class:`FreelancerProfile` so the identity/marketplace-mirror data and the tuning
+    weights don't share a row. Explicit columns rather than a JSONB blob because these are edited by
+    hand and burying them would make every change a blind write.
+    """
+
+    __tablename__ = "profile_configs"
+
+    id: Mapped[uuid.UUID] = _pk()
+    profile_id: Mapped[uuid.UUID] = _fk("freelancer_profiles.id", unique=True, index=True)
+
+    weight_skills: Mapped[float] = mapped_column(Float, default=60.0)
+    weight_budget: Mapped[float] = mapped_column(Float, default=20.0)
+    weight_competition: Mapped[float] = mapped_column(Float, default=10.0)
+    weight_recency: Mapped[float] = mapped_column(Float, default=10.0)
+
+    # The bid count at which competition scores half marks. Not a cap: a crowded posting loses
+    # points, it is never hidden. See ``scoring._score_competition``.
+    crowded_at_bids: Mapped[int] = mapped_column(Integer, default=25)
+    min_match_score: Mapped[float] = mapped_column(Float, default=55.0)
+
+    keywords_include: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    keywords_exclude: Mapped[list[str]] = mapped_column(JSONB, default=list)
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    profile: Mapped[FreelancerProfile] = relationship(back_populates="config")
 
 
 # --- marketplace data ---------------------------------------------------------------
@@ -684,3 +739,106 @@ class ApiToken(Base):
     )
     # Revoked rather than deleted: "this token was used, then revoked" is worth being able to see.
     revoked_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PageCapture(Base):
+    """A page the extension read that has no modelled home yet — kept whole, for later.
+
+    Contracts, proposals, orders and message-room lists all arrive as loose rows: the reader assumes
+    nothing about their columns, because every marketplace lays them out differently. Modelling them
+    properly means decisions that aren't made yet (a proposal needs a resolved project, a contract
+    needs a table of its own), and the data exists only while a person is looking at the page.
+
+    So it is accumulated verbatim instead of discarded. ``items`` is the reader's output untouched
+    and ``page_text`` is what a person saw; between them, v2 can extract whatever shape it settles
+    on without asking anyone to re-collect a month of history. ``parsed`` holds an LLM reading when
+    one was paid for at capture time, kept beside the raw rather than in place of it — a model's
+    interpretation is not evidence, and the raw is what a later, better prompt gets to re-read.
+
+    Owned by a user, unlike ``projects``. A posting is public and shared; your contracts and your
+    inbox are not.
+    """
+
+    __tablename__ = "page_captures"
+    __table_args__ = (
+        # One row per distinct sighting. Re-collecting an unchanged page bumps ``times_seen``
+        # instead of piling up identical copies, which is what "accumulate" has to mean if the
+        # table is still readable after a hundred runs. A changed page is a new row — the point.
+        UniqueConstraint(
+            "user_id", "platform", "page_key", "content_hash", name="uq_capture_user_page_content"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = _fk("users.id", index=True)
+
+    platform: Mapped[str] = mapped_column(String(50), index=True)
+    # Which page of that marketplace, from the extension's registry: "contracts", "pph_proposals".
+    page_key: Mapped[str] = mapped_column(String(100), index=True)
+    page_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Which reader produced ``items`` — "rows" or "rooms". What tells a later reader its shape.
+    reads: Mapped[str] = mapped_column(String(20))
+    page_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    item_count: Mapped[int] = mapped_column(Integer, default=0)
+    # The visible text, kept because the rows are only ever a partial reading of it. Bounded by the
+    # extension at 3k characters for a rows page.
+    page_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # An LLM reading of the same page, when one was asked for. Null means nobody has paid to
+    # interpret this capture yet — not that it can't be.
+    parsed: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    parsed_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Fingerprint of ``items``: what makes a re-sighting recognisable as the same page.
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    times_seen: Mapped[int] = mapped_column(Integer, default=1)
+
+    # The client's clock, at the moment the DOM was read.
+    scraped_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CaptureStatus(Base):
+    """Whether the extension can currently read a marketplace — one row per user per platform.
+
+    This exists because of a failure mode with no symptom. Signed out of Upwork, every find-work
+    URL redirects to a login page that loads perfectly; the reader finds no job links on it and
+    reports zero. Nothing is broken, nothing errors, and the board quietly stops being refreshed
+    while continuing to look authoritative.
+
+    The extension now recognises that wall and says so, and this is where it lands so the app can
+    tell someone. ``since`` is when it first went wrong and ``last_checked_at`` is the most recent
+    attempt: "signed out for three days" and "signed out just now" deserve different words, and one
+    timestamp cannot say both.
+
+    Latest state per platform, not a log — a banner needs one answer, and an ``OK`` capture clears
+    the problem rather than appending to it.
+    """
+
+    __tablename__ = "capture_statuses"
+    __table_args__ = (
+        UniqueConstraint("user_id", "platform", name="uq_capture_status_user_platform"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = _fk("users.id", index=True)
+    platform: Mapped[str] = mapped_column(String(50), index=True)
+
+    # OK | SIGNED_OUT | BLOCKED. A string like every enum here, so adding one is a code change.
+    status: Mapped[str] = mapped_column(String(20), default="OK", index=True)
+    # The reader's own words, so the app can show a reason instead of a status code.
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Which page hit it — the first one to, since the run stops there.
+    page_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # When it first went wrong, held across failures. Null while the status is OK.
+    since: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_checked_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # When it last worked. Null means the extension has never successfully read this marketplace,
+    # which the UI must not describe as "expired".
+    last_ok_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

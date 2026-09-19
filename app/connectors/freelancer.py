@@ -17,6 +17,8 @@ from typing import Any
 
 import httpx
 
+from app.connectors.base import ConnectorError
+
 logger = logging.getLogger(__name__)
 
 # Module-wide cache for the skill catalogue (see ``fetch_skill_catalogue``). It's the same static,
@@ -33,6 +35,8 @@ JOBS_PATH = "/projects/0.1/jobs/"
 BIDS_PATH = "/projects/0.1/bids/"
 PROJECTS_BY_ID_PATH = "/projects/0.1/projects/"
 SELF_PATH = "/users/0.1/self/"
+# Portfolio items live on their own endpoint — ``self`` only returns ``portfolio_count``.
+PORTFOLIO_PATH = "/users/0.1/portfolios/"
 
 # Only for vocabulary Freelancer names differently enough that no amount of string matching gets
 # there — "llm" will never resolve to "Artificial Intelligence" on its own. Everything else
@@ -71,8 +75,8 @@ class JobPosting:
     posted_at: dt.datetime | None = None
 
 
-class FreelancerAPIError(RuntimeError):
-    pass
+class FreelancerAPIError(ConnectorError):
+    """A Freelancer call failed. Subclasses ``ConnectorError`` so callers can stay neutral."""
 
 
 class FreelancerClient:
@@ -115,6 +119,17 @@ class FreelancerClient:
         if not user_id:
             raise FreelancerAPIError(f"Could not read own user id from {payload}")
         return int(user_id)
+
+    async def fetch_portfolio(self, user_id: int) -> list[dict[str, Any]]:
+        """The account's portfolio items, normalised for the profile.
+
+        A separate endpoint from ``self`` — which only carries ``portfolio_count`` — so it's fetched
+        on its own. Keyed by user id in the response; no portfolio returns an empty list.
+        """
+        payload = await self._get(f"{API_BASE}{PORTFOLIO_PATH}", {"users[]": user_id})
+        buckets = (payload.get("result") or {}).get("portfolios") or {}
+        raw = buckets.get(str(user_id)) or []
+        return [normalize_portfolio_entry(e) for e in raw if isinstance(e, dict)]
 
     async def submit_bid(
         self,
@@ -346,6 +361,91 @@ class FreelancerClient:
             return response.json()
 
         raise FreelancerAPIError("Exhausted retries without a response")
+
+
+def self_profile_fields(me: dict[str, Any]) -> dict[str, Any]:
+    """Map a Freelancer ``/users/0.1/self/`` payload onto :class:`FreelancerProfile` mirror columns.
+
+    Returns only the keys the payload actually carried, so applying it with ``setattr`` never blanks
+    a field the response happened to omit. ``currency`` is returned too, but the caller decides
+    whether to adopt it — that depends on whether scoring floors have been set, which is not this
+    function's business.
+    """
+    fields: dict[str, Any] = {}
+
+    # The API returns several avatar sizes; prefer the large CDN one (scaled down beats scaled up).
+    # Some are protocol-relative — a bare //host path won't load, so give it a scheme.
+    avatar = (
+        me.get("avatar_large_cdn")
+        or me.get("avatar_cdn")
+        or me.get("avatar_large")
+        or me.get("avatar")
+    )
+    if avatar:
+        fields["avatar_url"] = f"https:{avatar}" if avatar.startswith("//") else avatar
+
+    name = me.get("public_name") or me.get("display_name")
+    if name:
+        fields["display_name"] = name
+    if me.get("tagline") is not None:
+        fields["tagline"] = me.get("tagline")
+    if me.get("profile_description") is not None:
+        fields["summary"] = me.get("profile_description")
+
+    jobs = [j["name"] for j in (me.get("jobs") or []) if isinstance(j, dict) and j.get("name")]
+    if jobs:
+        fields["account_skills"] = jobs
+
+    reputation = (me.get("reputation") or {}).get("entire_history") or {}
+    if reputation.get("overall") is not None:
+        fields["rating"] = float(reputation["overall"])
+    if reputation.get("reviews") is not None:
+        fields["total_reviews"] = int(reputation["reviews"])
+
+    if isinstance(me.get("hourly_rate"), int | float):
+        fields["hourly_rate"] = float(me["hourly_rate"])
+    if isinstance(me.get("portfolio_count"), int | float):
+        fields["portfolio_count"] = int(me["portfolio_count"])
+
+    country = ((me.get("location") or {}).get("country") or {}).get("name")
+    if country:
+        fields["country"] = country
+
+    currency = (me.get("primary_currency") or {}).get("code")
+    if currency:
+        fields["currency"] = currency
+
+    registered = me.get("registration_date")
+    if isinstance(registered, int | float):
+        fields["member_since"] = dt.datetime.fromtimestamp(registered, tz=dt.UTC)
+
+    return fields
+
+
+def normalize_portfolio_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """One portfolio item, flattened to what the profile card renders.
+
+    Picks a display image from the first file's first thumbnail (a video item has no image of its
+    own, only thumbnails), and gives protocol-relative CDN urls a scheme so they load in an img tag.
+    """
+    image: str | None = None
+    for f in entry.get("files") or []:
+        if not isinstance(f, dict):
+            continue
+        thumbs = f.get("thumbnails") or []
+        thumb = thumbs[0].get("cdn_url") if thumbs and isinstance(thumbs[0], dict) else None
+        cdn = thumb or f.get("cdn_url")
+        if cdn:
+            image = f"https:{cdn}" if cdn.startswith("//") else cdn
+            break
+
+    return {
+        "title": entry.get("title") or "",
+        "description": entry.get("description") or "",
+        "content_type": entry.get("content_type"),
+        "featured": bool(entry.get("featured")),
+        "image": image,
+    }
 
 
 def normalize_project(raw: dict[str, Any]) -> JobPosting:

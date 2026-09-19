@@ -169,7 +169,9 @@ async def _match_with_gemini(message: str) -> SkillMatch:
     candidates = data.get("candidates") or []
     if not candidates:
         blocked = (data.get("promptFeedback") or {}).get("blockReason")
-        raise MatchingError(f"Gemini returned no candidates{f' (blocked: {blocked})' if blocked else ''}")
+        raise MatchingError(
+            f"Gemini returned no candidates{f' (blocked: {blocked})' if blocked else ''}"
+        )
 
     parts = (candidates[0].get("content") or {}).get("parts") or []
     text = "".join(part.get("text", "") for part in parts).strip()

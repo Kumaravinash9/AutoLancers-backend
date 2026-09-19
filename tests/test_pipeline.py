@@ -90,7 +90,8 @@ class TestWorthMatching:
         assert _worth_matching(make_job(), make_profile(skills=[])) is False
 
     def test_hard_rejected_job_skips(self, settings):
-        """A keyword/budget rejection is final regardless of skill fit — don't pay the LLM for it."""
+        """A keyword/budget rejection is final regardless of skill fit — don't pay the LLM
+        for it."""
         settings(skill_match_enabled=True)
         job = make_job(description="This is an unpaid volunteer role.")
         assert _worth_matching(job, make_profile()) is False
